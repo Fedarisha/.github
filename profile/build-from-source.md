@@ -59,9 +59,11 @@ Backend забирает frontend как zip из релиза (`ARG FRONTEND_UR
 cd ~/fedarisha/frontend
 npm ci
 npm run start:build
-( cd dist && zip -r ../remnawave-frontend.zip . )
+zip -r remnawave-frontend.zip dist          # архив ДОЛЖЕН содержать каталог dist/ внутри
 # затем gh release create vX.Y.Z-fed.N remnawave-frontend.zip
 ```
+
+> Внимание: backend's `Dockerfile` распаковывает архив в `frontend_temp/` и затем `COPY --from=frontend /opt/frontend/frontend_temp/dist ./frontend` — значит zip обязан содержать верхний каталог `dist/`. Если запаковать `( cd dist && zip -r ../x.zip . )` (без `dist/` в архиве), backend упадёт на следующем `curl -o frontend_temp/dist/assets/...` с `No such file or directory`.
 
 По умолчанию backend ходит на `https://github.com/Fedarisha/frontend/releases/latest/download/remnawave-frontend.zip`.
 
