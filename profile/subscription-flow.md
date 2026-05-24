@@ -1,107 +1,97 @@
-# Subscription flow
+# Provisioning и subscription flow
 
-Как пользователь панели получает рабочую fedarisha-подписку: от событий lifecycle до JSON, который грузит клиент.
+Подробности того, как бэкенд решает, какой PAK выдать пользователю, как кеширует его, и что попадает в подписку. Если ещё не читал [architecture.md](architecture.md) — там сначала.
 
-## TL;DR
+## Один цикл целиком
 
-```
-USER.ENABLED / TRAFFIC_RESET / MODIFIED   →  ensureForUser(userId)
-                                              ├─ для каждого fedarisha-inbound:
-                                              │   POST /node/fedarisha/provision-user
-                                              └─ сохранить PAK в user_meta.metadata.fedarisha
+Сценарий: alice активируется, тянет подписку, потом её банят. Ниже — что происходит в коде на каждом шаге.
 
-USER.DELETED / DISABLED / LIMITED / EXPIRED → revokeForUser(userId)
-                                              ├─ для каждого кешированного PAK:
-                                              │   POST /node/fedarisha/revoke-user
-                                              └─ очистить user_meta.metadata.fedarisha
+### Активация: USER.ENABLED → ensureForUser
 
-GET https://sub.example.com/{shortUuid}/fedarisha-json
-   → subscription-page → backend → xray-json.generator
-     → для каждого fedarisha-host: buildOutboundForHost
-        ├─ fast-path: probe кеша + переотдать тот же PAK
-        └─ miss: ensureCredentials → node provision → store → render
-```
+Бэкенд использует обычный NestJS `EventEmitter` (не CQRS — несмотря на то, что CQRS-инфраструктура в проекте есть). Хендлеры в `FedarishaProvisioningEvents` слушают:
 
-## Event-driven provisioning
-
-[`FedarishaProvisioningEvents`](https://github.com/Fedarisha/backend/blob/main/src/modules/fedarisha-provisioning/fedarisha-provisioning.events.ts) подписан на user lifecycle через `@OnEvent` (event-emitter, не CQRS — несмотря на наличие CQRS-инфраструктуры в проекте).
-
-| Событие | Условие | Действие |
+| Событие | Условие | Что делает |
 | --- | --- | --- |
-| `USER.CREATED` | — | (не подписан; реальное провижн идёт через `ENABLED`, которое следом эмитится) |
-| `USER.ENABLED` | `user.status === ACTIVE` | `ensureForUser` |
-| `USER.TRAFFIC_RESET` | `user.status === ACTIVE` | `ensureForUser` |
-| `USER.MODIFIED` | `user.status === ACTIVE` | `ensureForUser` |
-| `USER.DISABLED` | — | `revokeForUser` |
-| `USER.LIMITED` | — | `revokeForUser` |
-| `USER.EXPIRED` | — | `revokeForUser` |
-| `USER.DELETED` | — | `revokeForUser` |
-| `USER.REVOKED` | — | (используется upstream для ротации credentials VLESS/Trojan; fedarisha re-issue делает через TRAFFIC_RESET / MODIFIED, явный handler не нужен) |
+| `USER.ENABLED` | `user.status === ACTIVE` | `ensureForUser(userId)` |
+| `USER.TRAFFIC_RESET` | `user.status === ACTIVE` | `ensureForUser(userId)` |
+| `USER.MODIFIED` | `user.status === ACTIVE` | `ensureForUser(userId)` |
+| `USER.DISABLED / LIMITED / EXPIRED / DELETED` | — | `revokeForUser(userId)` |
 
-Все handler'ы выполняются **асинхронно** (event-emitter не блокирует saga, выпустившую событие). Если node недоступна:
-- `provision` failures → warning в логи, кеш не обновляется, на следующем `buildOutboundForHost` retry;
-- `revoke` failures → warning, **запись из UserMeta всё равно удаляется**. Это критично: иначе старый PAK останется в кеше и попадёт в подписку при последующих рендерах.
+`USER.CREATED` явно не подписан — следом всегда летит `USER.ENABLED`, на нём всё и провижится. `USER.REVOKED` тоже не подписан — это апстрим-событие для ротации VLESS/Trojan-секретов, fedarisha re-issue делает через `TRAFFIC_RESET`/`MODIFIED`.
 
-## ensureForUser (bulk provisioning)
+Все хендлеры **асинхронные** — saga, выпустившая событие, не блокируется. Поведение при сбое ноды:
+
+- `provision` падает → warning в логи, кеш не обновляется. На ближайшем `buildOutboundForHost` будет retry.
+- `revoke` падает → warning, **но запись из UserMeta всё равно удаляется**. Иначе мёртвый PAK останется в кеше и продолжит попадать в подписки.
+
+### ensureForUser: для всех инбаундов сразу
 
 ```
-1. listPaks(userId)                                   // что уже в кеше
-2. findUserFedarishaInbounds(userId)                  // на что юзер entitled
-3. для каждого inbound без свежего кеша:
-   a. findFirstNodeByInbound(inbound)                 // на какой ноде сейчас
-   b. resolveUserPrefix(inbound.basePrefix, userId)   // куда писать
-   c. ensureCredentials({ userId, userUuid, inbound, prefix })
-   d. upsertPak(userId, inboundTag, response)
+listPaks(userId)                              ← что уже кешировано
+findUserFedarishaInbounds(userId)             ← на что юзер entitled через squad'ы
+для каждого inbound без свежего кеша:
+    node    = findFirstNodeByInbound(inbound)
+    prefix  = resolveUserPrefix(inbound.basePrefix, userId)   // = "<basePrefix>/<userId>/"
+    creds   = ensureCredentials({ userId, userUuid, inbound, prefix })
+    upsertPak(userId, inbound.inboundTag, creds)
 ```
 
-**Quick-path:** если в кеше уже есть PAK с тем же `prefix` И `probeUser` вернул `exists: true` — заново ничего не дёргаем.
+Тут есть тонкость: `ensureForUser` **не лезет в инбаунды, у которых уже есть кеш с правильным префиксом**. Реальный probe и решение «жив ли PAK» делается позже в `ensureCredentials`. Это значит, что событие `USER.ENABLED` не вызывает шквала S3-вызовов, если кеш живой.
 
-**Prefix mismatch:** если в кеше есть PAK, но `prefix` другой (админ поменял `basePrefix` инбаунда) — **сначала revoke старого**, потом provision нового. Без этого revoke на VK Cloud упадём в `UserAlreadyExists`: namespace PAK-имён в VK Cloud — per-master-account, имя одно и то же, а prefix новый, провайдер не даёт overwrite.
+Если для `configProfileUuid` нет ни одной enabled-ноды — warning, инбаунд молча пропускается. Когда нода появится, ближайший fetch подписки вызовет `ensureCredentials` через `buildOutboundForHost`, и провижн произойдёт там.
 
-**Без ноды:** если для `configProfileUuid` нет ни одной enabled ноды — warning, inbound пропускается. Когда нода появится, следующий subscription-fetch повторит попытку (ensureCredentials дёрнется внутри `buildOutboundForHost`).
+### ensureCredentials: где принимаются решения
 
-## ensureCredentials (single inbound)
+Это единственное место, где панель реально ходит на ноду за PAK. Используется и из `ensureForUser` (массовое), и из `buildOutboundForHost` (по требованию во время рендера подписки).
 
-Используется и из `ensureForUser`, и из subscription-render (`buildOutboundForHost`). Это единственная точка, где panel реально ходит в node за PAK.
+Логика по шагам:
+
+**Шаг 1 — есть ли кеш с правильным префиксом?**
 
 ```typescript
-ensureCredentials({ userId, userUuid, inbound }) {
-  const expectedPrefix = `${inbound.basePrefix}/${userId}/`;
-  const cached = getPak(userId, inbound.inboundTag);
+const expectedPrefix = `${trimmedBasePrefix}/${userId}/`;   // resolveUserPrefix
+const cached = getPak(userId, inbound.inboundTag);
 
-  // 1. fast-path: kosher cache
-  if (cached && cached.prefix === expectedPrefix) {
-    const probe = await probeFedarishaUser(node, userUuid, inboundTag, expectedPrefix, cached.accessKey, cached.secretKey);
-    if (probe.isOk && probe.exists) return cached;     // кеш живой
-    if (!probe.isOk) return cached;                    // транспортный hiccup — отдаём что есть
-    // else: probe ok, но PAK мёртв (revoked, бакет пересоздан) → re-issue
-  }
-
-  // 2. prefix changed → revoke первого, затем re-issue
-  if (cached && cached.prefix !== expectedPrefix) {
-    await revokeFedarishaUser(node, userUuid, inboundTag, cached.prefix);   // best-effort
-  }
-
-  // 3. provision свежий
-  const response = await provisionFedarishaUser(node, userUuid, inboundTag, expectedPrefix);
-  if (!response.isOk) return null;                     // нода не смогла — host выпадет из подписки
-
-  // 4. cache
-  await upsertPak(userId, inboundTag, {
-    accessKey: response.accessKey,
-    secretKey: response.secretKey,
-    prefix: expectedPrefix,
-    configProfileUuid: inbound.configProfileUuid,
-    issuedAt: new Date().toISOString(),
-  });
-
-  return { accessKey, secretKey, prefix: expectedPrefix };
+if (cached && cached.prefix === expectedPrefix) {
+    // → probe
 }
 ```
 
-**Контракт «transport hiccup → keep cache»** важен: если node моргнула на 30 секунд во время probe, клиент **не должен** получить пустую подписку. Старый PAK почти наверняка ещё работает.
+**Шаг 2 — probe.** Если кеш есть и префикс совпадает, проверяем что PAK ещё работает:
 
-## Хранилище кеша
+```typescript
+const probe = await probeFedarishaUser(node, userUuid, inboundTag, expectedPrefix,
+                                       cached.accessKey, cached.secretKey);
+
+if (probe.isOk && probe.exists) return cached;       // живой → отдаём как есть
+if (!probe.isOk)                return cached;       // транспортный сбой → не трогаем кеш
+// дошли сюда: probe прошёл, но PAK мёртв (revoked, бакет пересоздан) → re-issue
+```
+
+Контракт «transport hiccup → keep cache» важен. Если нода моргнула на 30 секунд, клиент **не должен** получить пустую подписку. Старый PAK почти наверняка ещё работает.
+
+**Шаг 3 — prefix changed.** Если кеш есть, но `expectedPrefix !== cached.prefix` (админ поменял `basePrefix` у инбаунда), сначала **revoke по старому префиксу**, потом provision по новому:
+
+```typescript
+if (cached && cached.prefix !== expectedPrefix) {
+    await revokeFedarishaUser(node, userUuid, inboundTag, cached.prefix);  // best-effort
+}
+```
+
+Без этого revoke'а на VK Cloud упадём в `UserAlreadyExists` — namespace PAK-имён у мастер-аккаунта общий, имя то же, а prefix новый, провайдер не даёт overwrite.
+
+**Шаг 4 — provision.** Идём на ноду:
+
+```typescript
+const r = await provisionFedarishaUser(node, userUuid, inboundTag, expectedPrefix);
+if (!r.isOk) return null;       // нода не смогла — хост выпадет из подписки
+```
+
+`null` — это сигнал `buildOutboundForHost` пропустить хост. Клиент получит подписку без этого инбаунда; на следующем refetch попытка повторится.
+
+**Шаг 5 — кеш.** Записываем в UserMeta и возвращаем.
+
+### Кеш: что и почему
 
 `user_meta.metadata.fedarisha` — JSONB-поле в Postgres:
 
@@ -118,88 +108,80 @@ ensureCredentials({ userId, userUuid, inbound }) {
 }
 ```
 
-Ключ верхнего уровня — `inboundTag`, не `configProfileInboundUuid`. Это даёт два свойства:
-- Перерегистрация инбаунда (delete + recreate с тем же тегом) — кеш переиспользуется;
-- Переименование тега в xray-config — кеш потерян, на следующем provision сработает createWithReclaim.
+Несколько решений в дизайне:
 
-`configProfileUuid` лежит в payload'е, чтобы `revokeForUser` мог зарезолвить нужную ноду даже если inbound уже выпилен из конфига.
+- **Ключ — `inboundTag`, не `configProfileInboundUuid`.** Пересоздание инбаунда с тем же тегом → кеш переиспользуется. Переименование тега → кеш потерян, но при следующем provision сработает `createWithReclaim` (нода найдёт orphan, удалит, выдаст новый).
+- **`configProfileUuid` хранится в payload'е.** Нужен `revokeForUser`'у, чтобы зарезолвить ноду даже если инбаунд уже удалён из конфига.
+- **`issuedAt` не используется для TTL.** PAK живут пока их явно не отзовут. Поле — для observability и дебага.
 
-`issuedAt` не используется для TTL — PAK живут пока их явно не отзовут. Поле — для observability/debug.
+### Рендер подписки: buildOutboundForHost
 
-## Subscription render
-
-[`FedarishaSubscriptionService.buildOutboundForHost`](https://github.com/Fedarisha/backend/blob/main/src/modules/fedarisha-provisioning/fedarisha-subscription.service.ts) вызывается генератором `xray-json` (и `singbox`-генератором, если поддерживается клиентом) для каждого fedarisha-host'а в подписке.
+Вызывается генератором `xray-json` для каждого fedarisha-хоста, который попал в выдачу пользователю.
 
 ```
 для каждого fedarisha-host:
-  rawInbound      = xray-config inbound с этим тегом
-  basePrefix      = rawInbound.settings.storage.prefix
-  baseStorage     = rawInbound.settings.storage
-  tuning          = rawInbound.settings.tuning
+    rawInbound  = xray-config inbound с этим тегом
+    baseStorage = rawInbound.settings.storage
+    tuning      = rawInbound.settings.tuning
 
-  node            = findFirstNodeByInbound(configProfileInboundUuid)
-  creds           = ensureCredentials({ userId, userUuid, inbound: { inboundTag, basePrefix, configProfileUuid, nodeAddress, nodePort }})
-  if !creds: skip this host
+    node = findFirstNodeByInbound(configProfileInboundUuid)
+    creds = ensureCredentials({ userId, userUuid, inbound })
+    if (!creds) continue              // нода не смогла → пропускаем хост
 
-  outbound = {
-    protocol: 'fedarisha',
-    settings: {
-      storage: {
-        type:      's3',                          ← всегда переписывается
-        bucket:    baseStorage.bucket,
-        endpoint:  baseStorage.endpoint,
-        region:    baseStorage.region,
-        prefix:    creds.prefix,                  ← per-user, не basePrefix
-        sessionsDir: baseStorage.sessionsDir ?? null,
-        accessKey: creds.accessKey,               ← PAK, не master
-        secretKey: creds.secretKey,               ← PAK, не master
-      },
-      tuning: tuning ?? null,
-    },
-    // streamSettings НЕ выставляется (см. ниже)
-  }
+    outbound = {
+        protocol: 'fedarisha',
+        settings: {
+            storage: {
+                type:        's3',                ← всегда переписывается
+                bucket:      baseStorage.bucket,
+                endpoint:    baseStorage.endpoint,
+                region:      baseStorage.region,
+                prefix:      creds.prefix,        ← per-user, не basePrefix
+                sessionsDir: baseStorage.sessionsDir ?? null,
+                accessKey:   creds.accessKey,     ← PAK, не master
+                secretKey:   creds.secretKey,
+            },
+            tuning: tuning ?? null,
+        },
+        // streamSettings НЕ выставляется
+    }
 ```
 
-### Что выкинуто из outbound
+Что исчезает из outbound по сравнению с inbound'ом, и почему:
 
-| Поле inbound'а | Почему не в outbound |
+| Поле inbound'а | Почему нет в outbound |
 | --- | --- |
-| `clients[]` | На клиенте нет auth — это server-side список разрешённых user.id |
-| `userLevel` | Аналогично — server-side fallback level |
+| `clients[]`, `userLevel` | Server-side список allowed user.id и fallback level. Клиенту знать не нужно. |
 | `webhook` | Серверная фича (S3 → node нотификации). Клиент только пишет/читает S3. |
-| `accessKey/secretKey` мастер-ключей | Заменены на per-user PAK |
-| `prefix` (basePrefix) | Заменён на per-user `<basePrefix>/<userId>/` |
-| `iam.*` | Селектел-специфика, нужна только node для управления credentials |
+| `accessKey/secretKey` мастера | Заменены на per-user PAK. |
+| `prefix` (basePrefix) | Заменён на `<basePrefix>/<userId>/`. |
+| `iam.*` | Селектел-специфика для управления service-юзерами. Клиенту вредна — это креды мастера. |
 
 ### Почему `type: 's3'`
 
-`vkcloud-pak`/`selectel-iam`/`static` — это **node-side понятия** (выбор PAK-провайдера). Клиентский xray-core-fedarisha их не знает: его `infra/conf/fedarisha.go` принимает только `s3`/`local` (+ алиасы коллапсятся в s3, но это для совместимости конфигов на сервере, а не для клиента).
+`vkcloud-pak`, `selectel-iam`, `static` — это node-side понятия (выбор провайдера для выдачи PAK). Клиентский xray-core-fedarisha их не понимает: его конфиг-парсер принимает `s3` или `local` (плюс алиасы на `s3` для совместимости конфигов между inbound и outbound, но это для сервера).
 
-Хардкод `type: 's3'` в [`fedarisha-subscription.service.ts`](https://github.com/Fedarisha/backend/blob/main/src/modules/fedarisha-provisioning/fedarisha-subscription.service.ts) — намеренная abstraction boundary: смена провайдера на ноде (vkcloud-pak → selectel-iam) не требует перевыпуска подписок.
+Хардкод `type: 's3'` в `buildOutboundForHost` — это **abstraction boundary**: смена провайдера на ноде (например, vkcloud-pak → selectel-iam) не требует перевыпуска подписок и обновления клиентов.
 
-### Почему нет `streamSettings`
+### Почему нет streamSettings
 
-В [`xray-json.generator.service.ts`](https://github.com/Fedarisha/backend/blob/main/src/modules/subscription-template/generators/xray-json.generator.service.ts) для всех протоколов рендерится `outbound.streamSettings` (TCP/WS/gRPC + TLS + sockopt). **Для fedarisha этот блок пропускается**:
+В `xray-json.generator.service.ts` для всех протоколов рендерится `outbound.streamSettings` (TCP/WS/gRPC + TLS + sockopt). Для fedarisha этот блок пропускается:
 
 ```typescript
-// Fedarisha is S3-backed: no transport, no TLS, no streamSettings.
 if (host.protocol !== 'fedarisha') {
     outbound.streamSettings = this.buildStreamSettings(host);
 }
 ```
 
-Транспорт fedarisha не использует сетевой endpoint — данные идут через S3. Любой `streamSettings` (включая `xtls`/`reality`) просто проигнорируется клиентским xray и засоряет конфиг.
+Транспорт fedarisha не использует сетевой endpoint — данные идут через S3. Любой `streamSettings` (включая `xtls`/`reality`) клиентский xray просто проигнорирует, а в конфиге создаст шум.
 
-## Subscription-page
+## Что отдаёт subscription-page
 
-Сам по себе backend отдаёт `xray-json` только если client-type зарегистрирован.
-
-[`subscription-page/backend/src/modules/root/root.controller.ts`](https://github.com/Fedarisha/subscription-page/blob/main/backend/src/modules/root/root.controller.ts) добавляет:
+Бэкенд рендерит fedarisha-only xray-json только если client-type зарегистрирован. В sub-page добавлено:
 
 ```typescript
 const FEDARISHA_CLIENT_TYPES: readonly string[] = ['fedarisha-json'];
 
-// в обработчике @Get([':shortUuid', ':shortUuid/:clientType'])
 const isKnownClientType =
     REQUEST_TEMPLATE_TYPE_VALUES.includes(clientType) ||
     FEDARISHA_CLIENT_TYPES.includes(clientType);
@@ -207,23 +189,21 @@ const isKnownClientType =
 
 При `GET /{shortUuid}/fedarisha-json`:
 
-1. Контроллер sub-page проверяет client-type → принимает `fedarisha-json`.
-2. Ходит в backend (`axios.getSubscription(clientIp, shortUuid, headers, true, 'fedarisha-json')`).
-3. Backend генератор для этого client-type рендерит xray-json **только** с fedarisha-outbound'ами; VLESS/Trojan-хосты отфильтрованы по протоколу.
-4. Sub-page возвращает JSON как есть (без HTML-обёртки).
+1. Контроллер sub-page видит client-type → принимает `fedarisha-json`.
+2. Проксирует в backend: `axios.getSubscription(clientIp, shortUuid, headers, true, 'fedarisha-json')`.
+3. Backend-генератор рендерит xray-json **только** с fedarisha-outbound'ами; VLESS/Trojan отфильтрованы по протоколу.
+4. Sub-page отдаёт JSON как есть, без HTML-обёртки.
 
-Этот URL зашивается в форки клиентов (v2rayN-fork, v2rayNG-fork) — пользователь кладёт его в "Subscription URL", клиент периодически refetch'ит.
-
-**Refresh interval** клиенты обычно ставят 12h. Поэтому event-driven `ensureForUser` (на `USER.ENABLED`) важен: без него юзер до 12 часов будет тянуть пустую подписку, пока не дёрнет subscription руками.
+Этот URL зашит в форки клиентов (`v2rayN`-fork, `v2rayNG`-fork). Пользователь кладёт его в «Subscription URL», клиент периодически refetch'ит. **Дефолтный интервал у клиентов — 12 часов.** Без event-driven `ensureForUser` юзер до 12 часов тянул бы пустую подписку после активации.
 
 ## Webhook defaults
 
-Когда backend генерирует xray-config для ноды (start-all-nodes-by-profile.processor), вызывается [`applyFedarishaWebhookDefaults`](https://github.com/Fedarisha/backend/blob/main/src/common/utils/apply-fedarisha-webhook-defaults.ts).
+Когда бэкенд собирает xray-config для ноды (через `start-all-nodes-by-profile.processor`), вызывается `applyFedarishaWebhookDefaults`:
 
 ```typescript
 const S3_STORAGE_TYPES = new Set(['vkcloud-pak', 'selectel-iam', 'static']);
 
-if (isFedarishaInbound && isS3Storage(settings) && settings.webhook is object) {
+if (isFedarishaInbound && isS3Storage(settings) && typeof settings.webhook === 'object') {
     settings.webhook.enabled    ??= true;
     settings.webhook.listen     ??= ':80';
     settings.webhook.publicUrl  ??= `http://${stripScheme(nodeAddress)}/webhook`;
@@ -231,41 +211,48 @@ if (isFedarishaInbound && isS3Storage(settings) && settings.webhook is object) {
 }
 ```
 
-Хитрость: если в xray-config панели стоит `"webhook": {}` (пустой объект) — backend заполнит дефолты. Если ключа `webhook` нет вообще — backend ничего не добавляет (webhook отключён). Если `"webhook": { "enabled": false }` — тоже отключён.
+Три состояния `webhook` в конфиге панели:
 
-S3-провайдеры (vkcloud-pak/selectel-iam/static) — единственные, у кого webhook'и имеют смысл. `localDir`-инбаунды webhook'и не получают (нет S3-источника событий).
+- Ключ `webhook` **отсутствует** → бэкенд ничего не добавляет, webhook отключён.
+- `"webhook": {}` (пустой объект) → бэкенд заполняет дефолты.
+- `"webhook": { "enabled": false }` → тоже отключён (явное `false` не перезаписывается).
+
+S3-провайдеры — единственные, у кого webhook'и имеют смысл. `localDir`-инбаунды дефолтов не получают (нет S3-источника событий).
 
 ## Валидация на стороне панели
 
-[`FedarishaProtocolOptionsSchema`](https://github.com/Fedarisha/backend/blob/main/libs/contract/models/resolved-proxy-config.schema.ts) (Zod, поле discriminator `protocol === 'fedarisha'`):
+Zod-схема `FedarishaProtocolOptionsSchema` (поле discriminator `protocol === 'fedarisha'`):
 
 ```typescript
-const FedarishaProtocolOptionsSchema = z.object({
-  storage: z.object({
-    type:      z.string(),               // not enum — алиасы валидируются на node-стороне
-    bucket:    z.string(),
-    endpoint:  z.string(),
-    region:    z.string(),
-    prefix:    z.string(),
-    sessionsDir: z.string().nullable(),
-    accessKey: z.string(),
-    secretKey: z.string(),
-  }),
-  tuning: FedarishaTuningOptionsSchema.nullable(),
-});
+storage: z.object({
+  type:      z.string(),               // not enum
+  bucket:    z.string(),
+  endpoint:  z.string(),
+  region:    z.string(),
+  prefix:    z.string(),
+  sessionsDir: z.string().nullable(),
+  accessKey: z.string(),
+  secretKey: z.string(),
+}),
+tuning: FedarishaTuningOptionsSchema.nullable(),
 ```
 
-Schema не проверяет, что `type` входит в whitelist — это сделано чтобы добавить новый provider в node без peer-update backend'а. Но `applyFedarishaWebhookDefaults` использует whitelist (`S3_STORAGE_TYPES`), и node `resolveProviderKind` тоже строгий. Неизвестный `type`:
-- backend не подставит webhook-дефолты;
-- node вернёт `isOk: false, error: "storage.type must be explicitly set to one of …"`.
+Schema **не проверяет**, что `type` входит в whitelist. Сделано намеренно — чтобы добавить новый провайдер на ноду без peer-update бэкенда.
 
-## Failure modes (что увидит оператор)
+Но whitelist всё-таки есть, в двух местах:
+
+- `applyFedarishaWebhookDefaults` не подставит дефолты для неизвестного `type`.
+- Нодовый `resolveProviderKind` строгий: возвращает `isOk: false, error: "storage.type must be explicitly set to one of …"` для любого type вне `{vkcloud-pak, selectel-iam, static}`.
+
+## Failure modes
+
+Что увидит оператор и где смотреть:
 
 | Симптом | Где смотреть | Что произошло |
 | --- | --- | --- |
-| Подписка пустая, в backend logs warning `node …unreachable` | backend logs | Нода офлайн, host выпал из подписки. Клиент получит fedarisha-outbound на следующем refetch после восстановления. |
-| Подписка пустая, в logs `inbound … not found in xray config` | node logs | Backend дёрнул provision на inboundTag, которого нет в `xray_config`. Проверьте опубликован ли config-profile. |
-| Подписка отдаётся, но клиент не подключается | xray node logs | Чаще всего — webhook не настроен, и инбаунд не реагирует на новые сессии. Проверьте `pollIntervalMs` (≤ 500ms) или включите webhook. |
-| Подписка отдаётся со старыми ключами после revoke | sub-page → backend → UserMeta | Probe вернул `isOk: false` (нода не отвечала) → backend сохранил кеш. Дождитесь восстановления + следующего refetch. |
-| `UserAlreadyExists` в node logs на VK Cloud | node logs | Два инбаунда с одним мастер-ключом и разными бакетами без discriminator'а. Перепересоберите node с актуальной версией (sha1-suffix добавлен в pak.service). |
-| Provision fails на Selectel с `PolicyTooLarge` | node logs + Selectel S3 console | Достигнут 20 KB лимит bucket policy (~100-150 юзеров). Поднимите ещё один inbound с другим бакетом. |
+| Подписка пустая, в backend logs warning `node …unreachable` | backend logs | Нода офлайн, хост выпал из подписки. На следующем refetch (после восстановления) хост вернётся. |
+| Подписка пустая, в logs `inbound … not found in xray config` | node logs | Бэкенд дёрнул provision на `inboundTag`, которого нет в `xray_config` ноды. Config-profile не опубликован или нода читает старый. |
+| Подписка отдаётся, но клиент не подключается | xray node logs | Чаще всего — не настроен webhook, и инбаунд не реагирует на новые сессии. Проверьте `pollIntervalMs` (≤ 500ms) или включите webhook. |
+| Подписка со старыми ключами после revoke | sub-page → backend → UserMeta | Probe вернул `isOk: false` (нода не отвечала) → бэкенд сохранил старый кеш. Дождитесь восстановления и следующего refetch. |
+| `UserAlreadyExists` в node logs на VK Cloud | node logs | Два инбаунда с одним мастер-ключом и разными бакетами без discriminator'а. Перепересоберите node с актуальной версией (sha1-suffix добавляется в `buildPakUserName`). |
+| Provision fails на Selectel с `PolicyTooLarge` | node logs + Selectel S3 console | Достигнут 20 KB лимит bucket policy (~100–150 юзеров). Поднимите ещё один инбаунд с другим бакетом. |

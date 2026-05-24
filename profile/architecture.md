@@ -1,128 +1,193 @@
 # Архитектура форка
 
-Что добавлено поверх Remnawave и как компоненты разговаривают между собой.
+## В одну строку
 
-## Карта компонентов
+**Fedarisha — это Remnawave, в котором клиент общается с нодой через S3-бакет вместо TCP.** Всё остальное в этом документе — следствие.
 
-```
-                ┌─────────────────────────────────────────────────────┐
-                │                  Panel (backend)                    │
-                │                                                     │
-                │  ┌───────────────────────────────────────────────┐  │
-                │  │ fedarisha-provisioning module                 │  │
-                │  │ — слушает USER.*  → ensureForUser/revokeForUser│  │
-                │  │ — кеширует PAK в UserMeta.metadata.fedarisha  │  │
-                │  │ — оркестратор HTTP-вызовов к нодам            │  │
-                │  └───────────────────────────────────────────────┘  │
-                │  ┌───────────────────────────────────────────────┐  │
-                │  │ fedarisha-subscription.service                │  │
-                │  │ — собирает per-user outbound для xray-json    │  │
-                │  └───────────────────────────────────────────────┘  │
-                └───────────────────────┬─────────────────────────────┘
-                                        │
-                          HTTPS, NODE_JWT (bearer)
-                                        │
-                ┌───────────────────────▼─────────────────────────────┐
-                │                       Node                          │
-                │                                                     │
-                │  REST  /node/fedarisha/{provision,revoke,probe}-user│
-                │  ┌───────────────────────────────────────────────┐  │
-                │  │ FedarishaPakService (orchestrator)            │  │
-                │  │   ├─ PakService          (vkcloud-pak)        │  │
-                │  │   ├─ SelectelPakService  (selectel-iam)       │  │
-                │  │   └─ StaticPakService    (static)             │  │
-                │  └───────────────┬───────────────────────────────┘  │
-                │                  │ S3 / IAM API                     │
-                │                  ▼                                  │
-                │  ┌───────────────────────────────────────────────┐  │
-                │  │ xray-core (fedarisha inbound)                 │  │
-                │  │  webhook listener  ←──── S3 ObjectCreated     │  │
-                │  └───────────────────────────────────────────────┘  │
-                └───────────────────────┬─────────────────────────────┘
-                                        │
-                          S3 API (PUT/GET/LIST/DELETE)
-                                        │
-                ┌───────────────────────▼─────────────────────────────┐
-                │             Object storage (VK Cloud / Selectel /   │
-                │             MinIO / Garage / любой S3-compat)       │
-                │                                                     │
-                │  <bucket>/<prefix>/<userId>/sessions/<sessionId>/   │
-                │      c_00000000  s_00000000  c_00000001  ...        │
-                └───────────────────────▲─────────────────────────────┘
-                                        │
-                          S3 API (PUT/GET/LIST/DELETE)
-                                        │
-                ┌───────────────────────┴─────────────────────────────┐
-                │   Client (xray-core-bin / v2rayN-fork / v2rayNG-    │
-                │   fork) — подписка отдаёт outbound с per-user PAK,  │
-                │   клиент общается с node через S3, без TCP к ноде   │
-                └─────────────────────────────────────────────────────┘
+## Зачем
+
+В обычном VPN клиент знает адрес ноды и стучится туда напрямую. DPI это видит, провайдер блокирует адрес — VPN мёртв. Fedarisha делает по-другому:
+
+- Клиент получает доступ к **одной папке в S3-бакете публичного облака** (VK Cloud, Selectel — что угодно).
+- Нода читает и пишет в ту же папку.
+- DPI видит обычные S3 PUT/GET в адрес `hb.ru-msk.vkcloud-storage.ru`. Не VPN.
+
+Цена — латентность 50–250 мс (читаем файл, а не пакет) и стоимость S3-запросов. Зато блокировка ноды по IP больше не работает: чтобы заблокировать форк, провайдеру нужно отрезать целое облако.
+
+## Жизнь одного пользователя
+
+Самый понятный способ разобраться, как форк устроен — пройти один сценарий целиком. Возьмём пользователя `alice` и проследим всё от «админ нажал создать» до «клиент шлёт первый пакет».
+
+### Шаг 1. Админ создаёт alice в панели
+
+В панели alice привязана к Internal Squad, в котором есть fedarisha-инбаунд `fedarisha-eu`. Inbound сконфигурирован так:
+
+```jsonc
+{
+  "tag": "fedarisha-eu",
+  "protocol": "fedarisha",
+  "settings": {
+    "storage": {
+      "type":   "vkcloud-pak",                              // PAK-провайдер
+      "bucket": "vlt-fedarisha-eu",
+      "endpoint": "https://hb.ru-msk.vkcloud-storage.ru",
+      "region": "ru-msk",
+      "prefix": "users/main",                               // basePrefix
+      "accessKey": "<master S3 access>",                    // мастер, только для ноды
+      "secretKey": "<master S3 secret>"
+    },
+    "webhook": {}                                           // дефолты подставит backend
+  }
+}
 ```
 
-Между клиентом и нодой **нет сетевого соединения**: оба пишут/читают одни и те же объекты в одном бакете. PAK-ключи изолируют пользователей по префиксу.
+Бэкенд получает `USER.CREATED → USER.ENABLED` через `event-emitter`. Хендлер `FedarishaProvisioningEvents` вызывает `ensureForUser(alice.id)`.
 
-## Что лежит в каждом репозитории
+### Шаг 2. Бэкенд просит ноду выдать PAK
 
-| Репо | Что добавлено форком | Главные пути |
-| --- | --- | --- |
-| [`Xray-core-fedarisha`](https://github.com/Fedarisha/Xray-core-fedarisha) | Transport `fedarisha`: парсер, listener/dialer, S3 store, webhook registry, X25519+AES-GCM crypto | `proxy/fedarisha/` (~5500 LOC), `infra/conf/fedarisha.go` |
-| [`node`](https://github.com/Fedarisha/node) | NestJS-модуль `FedarishaPakModule`: REST-контракт + три провайдера PAK | `src/modules/fedarisha-pak/` (~900 LOC) |
-| [`backend`](https://github.com/Fedarisha/backend) | `FedarishaProvisioningModule` (события + кеш UserMeta), `FedarishaSubscriptionService` (рендер outbound), webhook-дефолты, Zod-схема | `src/modules/fedarisha-provisioning/`, `src/common/utils/apply-fedarisha-webhook-defaults.ts`, `libs/contract/models/resolved-proxy-config.schema.ts` |
-| [`subscription-page`](https://github.com/Fedarisha/subscription-page) | Регистрация client-type `fedarisha-json` | `backend/src/modules/root/root.controller.ts` |
-| [`v2rayN`](https://github.com/Fedarisha/v2rayN), [`v2rayNG`](https://github.com/Fedarisha/v2rayNG) | Форки клиентов с поддержкой `fedarisha-json` и встроенным xray-core-fedarisha | импортируют core/xray-core как git submodule |
+`ensureForUser` находит все fedarisha-инбаунды alice (у нас один, `fedarisha-eu`) и для каждого делает HTTP-вызов к соответствующей ноде:
 
-## Жизненный цикл одного пользователя
+```http
+POST https://node-eu:3001/node/fedarisha/provision-user
+Authorization: Bearer <NODE_JWT>
+Content-Type: application/json
 
-1. **Админ создаёт пользователя в панели и привязывает к Internal Squad с fedarisha-inbound.**
-2. Backend получает `USER.CREATED` → `USER.ENABLED` через `event-emitter`. Если `status === ACTIVE`, `FedarishaProvisioningEvents.onUserEnabled` зовёт `ensureForUser(userId)`.
-3. `ensureForUser` идёт в `internal_squad_inbounds`, находит все fedarisha-inbound'ы пользователя. Для каждого:
-   - Резолвит ноду по `configProfileUuid`.
-   - Шлёт `POST /node/fedarisha/provision-user` с `{userUuid, inboundTag, prefix}` (prefix = `<basePrefix>/<userId>/`).
-4. Node `FedarishaPakService` смотрит на `inbound.settings.storage.type`, выбирает провайдера, выдаёт PAK:
-   - `vkcloud-pak` — один S3-вызов `?prefixAccess`;
-   - `selectel-iam` — токен Keystone → IAM service user → bucket policy upsert → credential;
-   - `static` — pass-through мастер-ключей.
-5. Backend сохраняет ответ в `user_meta.metadata.fedarisha[inboundTag] = {accessKey, secretKey, prefix, configProfileUuid, issuedAt}`.
-6. **Клиент открывает подписку** `https://sub.example.com/{shortUuid}/fedarisha-json`. Subscription-page проксирует в backend, backend рендерит xray-json:
-   - Для каждого fedarisha-host вызывает `FedarishaSubscriptionService.buildOutboundForHost`.
-   - PAK достаётся из кеша (если нет — `ensureCredentials` сходит за свежим), `prefix` подставляется per-user, `storage.type` всегда переписывается на `"s3"`.
-7. Клиентский xray поднимает outbound, открывает session-папку в S3, пишет `c_hello`. Node-овский inbound либо просыпается по webhook'у S3, либо находит сессию на следующем `pollIntervalMs`, выдаёт `s_ack`, и начинается обмен.
-8. На любые изменения статуса пользователя:
-   - `USER.DISABLED/LIMITED/EXPIRED/DELETED` → `revokeForUser` → node удаляет PAK у провайдера → backend чистит `UserMeta.metadata.fedarisha`.
-   - `USER.TRAFFIC_RESET/MODIFIED` (status=ACTIVE) → `ensureForUser` (re-issue только если PAK потерян, иначе fast-path probe).
+{ "userUuid": "<alice uuid>", "inboundTag": "fedarisha-eu", "prefix": "users/main/<alice id>/" }
+```
 
-Подробно: [subscription-flow.md](subscription-flow.md), [node-api.md](node-api.md).
+Префикс — это `basePrefix + userId`. Именно к этой папке (и только к ней) у alice появится доступ.
 
-## Уровни изоляции (security model)
+### Шаг 3. Нода выдаёт PAK у VK Cloud
 
-| Уровень | Кто enforce'ит | Что защищает |
-| --- | --- | --- |
-| **L1: PAK / S3 ACL** | S3-провайдер (VK Cloud / Selectel) | Пользователь физически не может читать/писать чужие префиксы |
-| **L2: server gate** | xray inbound, `IsUserAllowed(userPrefix)` | Отозванный, но ещё не удалённый PAK не получит `s_ack` (закрывает race window между revoke и lifecycle expiration) |
-| **L3: E2E AES-GCM** | xray fedarisha-transport, X25519+HKDF | Даже если кто-то получит read-доступ к чужому префиксу (broken-by-design `static`-провайдер) — payload зашифрован |
+`FedarishaPakService` на ноде смотрит на `storage.type` инбаунда:
 
-`static` ломает L1 (все пользователи одни ключи), но L2/L3 остаются. Поэтому `static` подходит только single-tenant.
+- `vkcloud-pak` → один S3-вызов с параметром `?prefixAccess`. VK Cloud возвращает `accessKey/secretKey`, действующие только в пределах указанного префикса.
+- `selectel-iam` → создаёт IAM service user, бьёт его в bucket policy, выдаёт S3-credential.
+- `static` → отдаёт мастер-ключи без изменений (single-tenant, для отладки).
 
-## Кто хранит состояние
+Кроме PAK нода делает вторую вещь: добавляет alice как `user.id` в живой xray-runtime через xtls gRPC API (`addTrojanUser` — Trojan здесь как пустой carrier, см. [node-api.md](node-api.md#интеграция-с-xray-runtime-ноды)).
 
-| Хранилище | Что лежит | Кто пишет | Кто читает |
+Ответ возвращается бэкенду:
+
+```json
+{ "response": { "isOk": true, "accessKey": "AKIA…", "secretKey": "…", "error": null } }
+```
+
+### Шаг 4. Бэкенд кеширует PAK
+
+В Postgres, в JSONB-поле `user_meta.metadata.fedarisha`:
+
+```json
+{
+  "fedarisha-eu": {
+    "accessKey": "AKIA…",
+    "secretKey": "…",
+    "prefix":    "users/main/<alice id>/",
+    "configProfileUuid": "…",
+    "issuedAt": "2026-05-24T12:00:00.000Z"
+  }
+}
+```
+
+Ключ — `inboundTag`. Это значит: пересоздание инбаунда с тем же тегом сохраняет кеш; переименование тега — теряет (но при следующем provision сработает reclaim).
+
+### Шаг 5. Клиент запрашивает подписку
+
+Alice открывает в форк-клиенте (`v2rayN`/`v2rayNG`) ссылку:
+
+```
+https://sub.example.com/<alice shortUuid>/fedarisha-json
+```
+
+Этот URL обрабатывает `subscription-page`. Контроллер видит client-type `fedarisha-json`, проксирует запрос в backend, тот рендерит xray-config — но только из fedarisha-хостов, остальные протоколы отфильтрованы.
+
+Для каждого fedarisha-хоста бэкенд зовёт `buildOutboundForHost`, который собирает outbound из двух частей:
+
+- **Базовая часть** — берётся из xray-config инбаунда: bucket, endpoint, region, tuning.
+- **Per-user часть** — `prefix` подставляется alice'ин, `accessKey/secretKey` берутся из кеша. Если кеша нет или PAK не прошёл probe — `ensureCredentials` сходит на ноду за свежим прямо во время рендера подписки.
+
+Важный момент: в outbound клиента `storage.type` всегда `"s3"`, независимо от того, что стоит у инбаунда. PAK-провайдеры (vkcloud-pak, selectel-iam, static) — это **серверное** понятие; клиентский xray их не знает и не должен знать. Это даёт свободу: смена провайдера на ноде не требует перевыпуска подписок.
+
+### Шаг 6. Клиент пишет в S3
+
+Клиентский xray поднимает outbound, генерирует `sessionId` (16 случайных байт) и создаёт в бакете объект:
+
+```
+vlt-fedarisha-eu/users/main/<alice id>/sessions/<sessionId>/c_hello
+```
+
+В теле — публичный X25519-ключ клиента. С точки зрения S3 это обычный PUT, ничем не отличающийся от загрузки фотки.
+
+### Шаг 7. Нода видит сессию
+
+Здесь есть два пути:
+
+- **С webhook'ом** (default). VK Cloud / Selectel настроены слать `s3:ObjectCreated:Put` на endpoint ноды. Нода получает нотификацию, видит новый `c_hello`, отвечает `s_ack`. Латентность хендшейка — меньше 100 мс.
+- **Без webhook'а**. Нода поллит `LIST` сессионных папок с интервалом `pollIntervalMs` (по умолчанию 500 мс если webhook есть, 100 мс если нет). Латентность хендшейка — 50–500 мс.
+
+Дальше обмен идёт через нумерованные файлы `c_00000000`, `s_00000000`, … — каждый зашифрован AES-256-GCM сессионным ключом, выведенным из X25519. Подробности в [protocol.md](protocol.md).
+
+### Шаг 8. Что бывает, когда админ что-то меняет
+
+| Событие в панели | Что делает бэкенд |
+| --- | --- |
+| `USER.DISABLED / LIMITED / EXPIRED / DELETED` | `revokeForUser` — нода удаляет PAK у провайдера, бэкенд чистит кеш |
+| `USER.TRAFFIC_RESET / MODIFIED` (если `status=ACTIVE`) | `ensureForUser` — для каждого инбаунда: если PAK ещё жив (probe) — оставляем, иначе перевыпускаем |
+| Сменился `basePrefix` инбаунда | На следующем `ensureCredentials`: revoke старого PAK → provision новый. Без revoke на VK Cloud упадём в `UserAlreadyExists` |
+| Удалили нода из squad'а | Хост выпадает из подписки на следующем рендере. Кеш сам по себе не чистится — это намеренно, при возврате ноды кеш переиспользуется |
+
+Подробнее про events и кеш — [subscription-flow.md](subscription-flow.md).
+
+---
+
+## Кто что хранит
+
+Состояние форка разбросано по четырём местам. Когда дебагаешь — ищи здесь:
+
+| Где | Что | Кто пишет | Кто читает |
 | --- | --- | --- | --- |
-| **Panel Postgres** (`user_meta.metadata.fedarisha`) | PAK кеш, привязанный к (userId, inboundTag) | `FedarishaProvisioningRepository.upsertPak` | `ensureCredentials` (fast-path), `buildOutboundForHost`, `revokeForUser` |
-| **VK Cloud / мастер-аккаунт** | namespace PAK-имён | `pak.service.createKey` | `pak.service.deleteKey` |
-| **Selectel IAM** | service users + credentials | `selectel-pak.service.ensureServiceUser/createS3Credentials` | `selectel-pak.service.deleteCredentialsByName` |
-| **S3-бакет** `.fedarisha-pak-state/<basePrefix>.json` | members policy state (Selectel only) | `selectel-pak.service.upsertPolicyMember` | то же |
-| **S3-бакет** `<prefix>/<userId>/sessions/<sessionId>/` | сами сессии xray (зашифрованные чанки) | xray client + xray node | то же |
-| **Конфиг панели** (`xray_config`) | `inbounds[].settings.storage` (master-credentials, тип провайдера) | админ через UI | `FedarishaPakService.resolveStorage`, `buildOutboundForHost` |
+| **Postgres панели** (`user_meta.metadata.fedarisha`) | PAK-кеш `{accessKey, secretKey, prefix, configProfileUuid, issuedAt}` per `(userId, inboundTag)` | `FedarishaProvisioningRepository.upsertPak` | `ensureCredentials` (fast-path), `buildOutboundForHost`, `revokeForUser` |
+| **VK Cloud / Selectel мастер-аккаунт** | PAK-юзеры с правами на префиксы | `pak.service.createKey` / `selectel-pak.service.ensureServiceUser` | те же сервисы при delete |
+| **S3-бакет**, объект `.fedarisha-pak-state/<basePrefix>.json` | Список IAM-юзеров и их credentials (Selectel only — bucket policy перезаписывается целиком, и это единственный способ не потерять прежних members) | `selectel-pak.service.upsertPolicyMember` | то же |
+| **S3-бакет**, `<bucket>/<basePrefix>/<userId>/sessions/<sessionId>/` | Зашифрованные кадры сессий | xray client + xray node | то же |
 
-Master-credentials хранятся в xray-config панели как plain string — для secrets-management положите в Vault и пробросьте через ENV (не реализовано из коробки, апстримная фича Remnawave).
+Нода **локального state не держит** — никаких баз, никаких маппингов. Если бэкенд потеряет кеш — на следующем provision сработает `createWithReclaim` (нода увидит, что PAK уже есть, удалит и пересоздаст). Если бэкенд и нода рассинхронизировались по сессиям — S3 lifecycle через 24 часа всё подметёт.
 
-## Кто чем владеет (deploy ownership)
+## Уровни изоляции
 
-- **Бакет под fedarisha — отдельный, дедицированный.** Selectel перезаписывает bucket policy целиком; VK Cloud PAK не конфликтует, но GC сметает любые файлы старше 1 дня в `/sessions/`-префиксах через lifecycle rule.
-- **Master-credentials S3 — у node, не у клиента.** Клиентский xray получает только prefix-scoped PAK. Скомпрометированный клиент не повышает privileges.
-- **Webhook-endpoint — у node.** Backend подставляет дефолт `http://<nodeAddress>/webhook`, но саму регистрацию (PutBucketNotification) делает xray на старте при `autoSetup: true`.
-- **TLS до S3 / до webhook'а — внешний.** TLS-cert/key для webhook'а можно указать в `settings.webhook.tlsCert/tlsKey` (пути внутри node-контейнера), или поднять Caddy/nginx перед нодой.
+Между alice и bob'ом стоят три барьера. Если ломается один — два других ещё держат:
 
-## Полная цепочка зависимостей версий
+**L1: PAK / S3 ACL.** Alice физически не может прочитать `users/main/<bob id>/`. Это enforce'ит S3-провайдер. Самый сильный уровень — без сговора с провайдером не обойти.
 
-См. [build-from-source.md](build-from-source.md). Пин-файлы (`node/.xray-core-version`, `backend/.frontend-version`) фиксируют upstream-теги; нарушение пина — основание перепересобрать всё ниже по цепочке.
+**L2: server gate в xray-инбаунде.** Перед тем как ответить `s_ack`, инбаунд проверяет `IsUserAllowed(userPrefix)`. Если PAK был отозван секунду назад — alice уже не сможет открыть сессию, даже если S3-ключ ещё технически работает (TTL у revoke не мгновенный). Это закрывает race window между revoke и реальным закрытием доступа.
+
+**L3: E2E AES-256-GCM.** Даже если кто-то получит read-доступ к чужому префиксу (например, в `static`-режиме все ходят под мастер-ключом) — payload зашифрован. Ключ выводится из X25519-handshake'а, в S3 хранится только publickey.
+
+`static` ломает L1 by design. Но L2/L3 на месте — поэтому `static` остаётся пригодным для single-tenant отладочных setup'ов.
+
+## Где какой код
+
+| Репозиторий | Что добавляет форк | Главные пути |
+| --- | --- | --- |
+| [`Xray-core-fedarisha`](https://github.com/Fedarisha/Xray-core-fedarisha) | Сам транспорт fedarisha: listener/dialer, S3-store, crypto, webhook-registry | `proxy/fedarisha/` |
+| [`node`](https://github.com/Fedarisha/node) | NestJS-модуль `FedarishaPakModule` — REST + три PAK-провайдера | `src/modules/fedarisha-pak/` |
+| [`backend`](https://github.com/Fedarisha/backend) | `FedarishaProvisioningModule` (events + кеш), `FedarishaSubscriptionService` (рендер), webhook-defaults, Zod-схема | `src/modules/fedarisha-provisioning/`, `src/common/utils/apply-fedarisha-webhook-defaults.ts` |
+| [`subscription-page`](https://github.com/Fedarisha/subscription-page) | Регистрация client-type `fedarisha-json` | `backend/src/modules/root/root.controller.ts` |
+| [`v2rayN`](https://github.com/Fedarisha/v2rayN), [`v2rayNG`](https://github.com/Fedarisha/v2rayNG) | Форки клиентов с встроенным xray-core-fedarisha и пониманием `fedarisha-json` | импортируют ядро как submodule |
+
+## Что важно знать про деплой
+
+**Бакет под fedarisha — отдельный, дедицированный.** Не складывайте туда ничего полезного. Selectel перезаписывает bucket policy целиком на каждое изменение members, а xray ставит lifecycle-rule, который удаляет всё в `/sessions/`-префиксах старше 24 часов.
+
+**Master S3 credentials живут только на ноде.** В UI панели они лежат в xray-config как plain text — клиенту не уходят никогда. Клиентский xray получает только prefix-scoped PAK; компрометация клиента не повышает привилегий до мастера.
+
+**Webhook'и поднимает нода.** Бэкенд через `applyFedarishaWebhookDefaults` подставляет в конфиг ноды дефолты (`:80`, `/webhook`, `autoSetup: true`). Сама же регистрация (PutBucketNotification у S3-провайдера) делается xray на старте инбаунда.
+
+**TLS для webhook'а — на усмотрение оператора.** Можно прописать `settings.webhook.tlsCert/tlsKey` (пути внутри node-контейнера) или поставить Caddy/nginx перед нодой. VK Cloud валидирует подпись HMAC-цепочкой, xray-listener отвечает на неё автоматически.
+
+## Дальше
+
+- **[protocol.md](protocol.md)** — что лежит в бакете, как устроен handshake, как фреймится трафик.
+- **[node-api.md](node-api.md)** — три REST-эндпоинта ноды, формат запросов/ответов, как ведёт себя при сбоях.
+- **[subscription-flow.md](subscription-flow.md)** — детально про events, ensureCredentials, рендер outbound, failure modes.
+- **[build-from-source.md](build-from-source.md)** — собрать форк руками.

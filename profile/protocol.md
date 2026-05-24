@@ -1,35 +1,40 @@
 # Wire-протокол fedarisha-транспорта
 
-Что лежит в бакете, как клиент и нода о нём договариваются. Исходник — [`Xray-core-fedarisha/proxy/fedarisha/`](https://github.com/Fedarisha/Xray-core-fedarisha/tree/main/proxy/fedarisha).
+Если совсем коротко: **клиент и нода не открывают сокет — они оставляют друг другу файлы в общей папке S3**. Этот документ — про то, какие именно файлы, как они шифруются и в каком порядке появляются.
 
-## Раскладка объектов в бакете
+Исходник всех деталей — [`Xray-core-fedarisha/proxy/fedarisha/`](https://github.com/Fedarisha/Xray-core-fedarisha/tree/main/proxy/fedarisha).
+
+## Анатомия сессии в бакете
 
 ```
 <bucket>/
-├── <basePrefix>/                                    ← из settings.storage.prefix
-│   ├── <userId-1>/                                  ← per-user PAK ограничен этим префиксом
+├── <basePrefix>/                                    ← settings.storage.prefix
+│   ├── <userId-1>/                                  ← PAK ограничен этим префиксом
 │   │   └── sessions/                                ← settings.storage.sessionsDir или "sessions"
 │   │       ├── <sessionId-aaaa>/                    ← одна сессия = одна папка
 │   │       │   ├── c_hello                          ← handshake-объект (client→server)
-│   │       │   ├── s_ack                            ← handshake-ответ (server→client)
-│   │       │   ├── c_00000000   c_00000001   ...    ← кадры client→server
-│   │       │   └── s_00000000   s_00000001   ...    ← кадры server→client
+│   │       │   ├── s_ack                            ← handshake-ответ  (server→client)
+│   │       │   ├── c_00000000  c_00000001  ...      ← кадры client→server
+│   │       │   └── s_00000000  s_00000001  ...      ← кадры server→client
 │   │       └── <sessionId-bbbb>/...
 │   └── <userId-2>/...
 └── .fedarisha-pak-state/                            ← только для Selectel-провайдера
     └── <basePrefix>.json
 ```
 
+Соглашения о именах:
+
 - `sessionId` — 16 случайных байт в hex (32 символа).
-- Имена кадров: `{c_|s_}{08x}` — direction-prefix + zero-padded hex sequence number, по одному на каждый направление.
+- Кадры именуются `{c_|s_}{08x}` — direction-prefix + zero-padded hex sequence number.
 - Клиент пишет только `c_*`, нода — только `s_*`. Перекрытий нет.
-- Lifecycle-правило (для S3-провайдеров) автоматически expires объекты старше 1 дня — защита от мёртвых сессий.
 
-## Handshake
+S3 lifecycle-rule `Expiration.Days: 1` ставится `SetupLifecycle` на старте инбаунда — защита от мёртвых сессий, которые никто не закрыл явно.
 
-Двусторонний X25519 + AES-256-GCM. Без сертификатов и без CA — auth через знание PAK-ключей (доступ к бакету = доказательство пользователя).
+## Handshake: X25519 поверх трёх объектов
 
-### Шаг 1: c_hello (клиент → S3)
+Без сертификатов, без CA. Аутентификация — через сам факт, что у клиента есть PAK с доступом к папке: если ты можешь писать в `<bucket>/<basePrefix>/<userId>/sessions/...`, ты — этот юзер.
+
+### c_hello — клиент кричит «привет»
 
 Клиент:
 
@@ -40,14 +45,20 @@
    [sessionId (16 байт) || clientPublic (32 байта)]
    ```
 
-### Шаг 2: s_ack (нода → S3)
+С точки зрения S3 это обычный PUT 48-байтового файла. Никакого ответа от ноды клиент пока не получил — он сейчас будет опрашивать `s_ack`.
 
-Нода (либо по webhook'у, либо на следующем `pollIntervalMs`):
+### s_ack — нода отвечает
 
-1. Видит новую sessions-папку, читает `c_hello`.
-2. Проверяет `IsUserAllowed(userPrefix)` (server gate, см. [architecture.md#уровни-изоляции](architecture.md)).
-3. Генерирует keypair X25519, считает shared secret `sharedKey = X25519(serverPrivate, clientPublic)`.
-4. Деривит ключ AES через HKDF-SHA256:
+Нода узнаёт о новой сессии одним из двух способов:
+
+- **С webhook'ом:** S3 шлёт нотификацию `s3:ObjectCreated:Put`, регистрация активной сессии срабатывает мгновенно (см. ниже про webhook fast-path).
+- **Без webhook'а:** listener делает `LIST` сессионных папок с интервалом `pollIntervalMs` (по умолчанию 500 мс если webhook есть как fallback, 10 секунд если webhook'а нет вообще — нюанс: значения подобраны так, чтобы не молотить S3, когда есть основной канал нотификаций).
+
+Дальше нода:
+
+1. Читает `c_hello`, проверяет `IsUserAllowed(userPrefix)` (server gate — закрывает race window между revoke и реальным удалением PAK).
+2. Генерирует свой keypair X25519, считает `sharedKey = X25519(serverPrivate, clientPublic)`.
+3. Выводит ключ AES через HKDF-SHA256:
    ```
    sessionKey = HKDF-SHA256(
        IKM  = sharedKey,
@@ -56,33 +67,33 @@
        len  = 32
    )
    ```
-5. Пишет `<sessions>/<sessionId>/s_ack` с телом `serverPublic` (32 байта).
-6. Удаляет `c_hello`.
+4. Пишет `<sessions>/<sessionId>/s_ack` с телом — `serverPublic` (32 байта).
+5. Удаляет `c_hello`.
 
-### Шаг 3: клиент подтверждает
+### Клиент подтверждает
 
-Клиент опрашивает `s_ack` до 60 секунд:
+Клиент опрашивает `s_ack` до 60 секунд. Когда видит:
 
 1. Получает `serverPublic`, считает тот же `sharedKey` и `sessionKey`.
 2. Удаляет `s_ack`.
 3. Поднимает yamux-мультиплекс поверх encrypted stream.
 
-С этого момента обе стороны пишут/читают кадры `c_<seq>` / `s_<seq>` со sequence от 0.
+С этого момента обе стороны пишут/читают кадры `c_<seq>` / `s_<seq>` со sequence от 0. Папка сессии больше не содержит handshake-объектов — только пронумерованные кадры.
 
-## Кадр (encrypted chunk)
+## Один кадр
 
 Каждый файл `c_<seq>` / `s_<seq>` — это один AES-GCM ciphertext:
 
 ```
 ciphertext = AES-256-GCM-Encrypt(
-    key   = sessionKey,
-    nonce = MakeNonce(direction, seq),
-    aad   = sessionId,
+    key       = sessionKey,
+    nonce     = MakeNonce(direction, seq),
+    aad       = sessionId,
     plaintext = framePayload
 )
 ```
 
-`MakeNonce` (12 байт):
+`MakeNonce` строит 12-байтовый nonce из:
 
 ```
 nonce[0:2]  = ASCII direction prefix ("c_" = 0x63 0x5f, "s_" = 0x73 0x5f)
@@ -90,32 +101,30 @@ nonce[2:4]  = 0x00 0x00 (padding)
 nonce[4:12] = big-endian uint64(seq)
 ```
 
-Это гарантирует уникальность nonce при ограничении на ≤ 2^64 кадров в направление (для практики бесконечность).
+Это даёт уникальность nonce до 2⁶⁴ кадров в направление (практически бесконечность). `aad = sessionId` обеспечивает, что кадр другой сессии не пройдёт authentication tag — даже если кто-то его подсунет.
 
-`aad = sessionId` обеспечивает, что кадр другой сессии не пройдёт authentication tag — даже если кто-то его подсунет.
+### Что лежит внутри ciphertext
 
-## Frame payload (внутри ciphertext)
-
-После расшифровки получается:
+После расшифровки:
 
 ```
-plaintext[0] = compression flag (0x00 = raw, 0x01 = deflate)
-plaintext[1:] = (raw или deflate-compressed) yamux-data
+plaintext[0]  = compression flag   (0x00 = raw, 0x01 = deflate)
+plaintext[1:] = (raw или deflate-сжатые) yamux-данные
 ```
 
-Encoder пробует deflate с `BestSpeed` (level 1). Если сжатый меньше исходного — флаг 0x01 + сжатые данные, иначе 0x00 + raw.
+Encoder пробует deflate с `BestSpeed` (level 1). Если сжатый меньше исходного — флаг `0x01` + сжатые данные, иначе `0x00` + raw. Флаг — **байт внутри ciphertext**, имя файла от компрессии не зависит.
 
 Yamux-data — стандартный yamux-стрим: handshake → frames → keepalive (60s). Внутри yamux-стрима каждое соединение начинается с **target header** (proxy-destination):
 
 ```
-[len_or_udp_flag uint16 BE]   ← биту 15 = 1 → UDP, иначе TCP
+[len_or_udp_flag uint16 BE]   ← бит 15 = 1 → UDP, иначе TCP
 [host bytes — N байт]
 [port uint16 BE]
 ```
 
 Дальше — обычный bidirectional bytestream.
 
-## UDP encapsulation
+### UDP-обёртка
 
 Поверх yamux-стрима для UDP-сессий каждый пакет фреймится:
 
@@ -128,29 +137,51 @@ Yamux-data — стандартный yamux-стрим: handshake → frames →
 
 Это позволяет stateless-проксировать UDP с пересылкой адреса назначения в каждом пакете.
 
-## Tuning (что управляется конфигом)
+## Как читаются кадры (важно: не LIST)
 
-Все четыре параметра живут в `settings.tuning` инбаунда. Полные значения и дефолты — [inbound-config.md](inbound-config.md), здесь — их смысл в терминах протокола.
+Conn'ы на обеих сторонах знают свой текущий `readSeq` и **запрашивают конкретный файл напрямую** (`GET <sessDir>/c_00000007`), а не сканируют папку через LIST. Это спасает от того, что LIST в S3 — eventually consistent и платный по другому тарифу.
+
+Чтобы скрыть latency:
+
+- Параллельно запускаются GET'ы для `seq`, `seq+1`, …, `seq+ahead` (ahead = 2 в idle, 4 в активной фазе).
+- Результаты складываются в `prefetchCache: map[uint64][]byte`.
+- При получении ожидаемого `seq` — берётся из кеша. Out-of-order ответы дождутся своего номера.
+- Дырки (404 на `seq+1` при наличии `seq+2`) останавливают consume — данные за gap'ом подождут, пока gap закроется.
+
+После того как кадр успешно расшифрован и положен в `readBuf`, его файл **удаляется немедленно** — в detached-горутине с собственным 10-секундным контекстом:
+
+```go
+go func(p string) {
+    dctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
+    _ = c.store.Delete(dctx, p)
+}(s.path)
+```
+
+Это даёт бакету не разрастаться даже на долгих сессиях. Если delete по какой-то причине не успел — на `conn.Close()` отработает `cleanupSession`, которая через `BatchDelete` (или per-file fallback) сметёт всё, что осталось в папке сессии.
+
+## Адаптивный polling
+
+Когда новых кадров нет, частота poll'а зависит от того, как давно был последний полезный фрейм:
+
+| Время с последнего получения | Интервал между fetchNext |
+| --- | --- |
+| `< 5s` | 20 мс — активный transfer |
+| `5–30s` | 100 мс — возможно, страница ещё догружается |
+| `> 30s` | 500 мс — truly idle |
+
+Если включён webhook — pollLoop вообще блокируется на канале нотификаций, и `select` срабатывает либо по сигналу, либо по 30-секундному safety-таймауту (страховка от потерянных нотификаций). В типичном S3-инбаунде с webhook'ом 99% wakeup'ов идут от нотификаций, не от таймера.
+
+## Tuning: параметры конфига
+
+Четыре параметра живут в `settings.tuning` инбаунда. Полные дефолты и формат — [inbound-config.md](inbound-config.md), здесь — смысл в терминах протокола.
 
 | Параметр | Где применяется | Влияние |
 | --- | --- | --- |
-| `pollIntervalMs` | `pollLoop` в conn.go | Базовый интервал LIST-запроса при отсутствии webhook'а или после misses. Адаптивный: при активности `<5s` → 20ms; `5-30s` → 100ms; `idle >30s` → 500ms. |
+| `pollIntervalMs` | `pollLoop` в conn.go (по сути — backstop) | Перекрывает адаптивный тайер 500 мс, если задан явно. В режиме с webhook'ом смысла мало — основной канал и так fast-path. |
 | `writeIntervalMs` | `writeLoop` в conn.go | Как часто writer флашит accumulator в S3. Меньше → ниже latency, но больше PUT'ов и мельче объекты. |
 | `idleTimeoutSec` | `idleWatcher` в conn.go | Сколько секунд без полученных данных до закрытия. Yamux keepalive (60s) ресетит таймер. |
 | `maxFileSizeBytes` | flush в conn.go | Лимит одного кадра. Превышение → разбивка на N PUT'ов размером ≤ лимита. |
-
-**`CleanupAge` = 30 секунд, hardcoded в `proxy/fedarisha/transport/protocol.go`.** Объекты, помеченные как обработанные, удаляются не сразу — даётся 30 секунд на возможный re-read из prefetch cache. Не настраивается из конфига.
-
-## Prefetch cache
-
-Чтобы скрыть latency S3-LIST'а, conn.go проактивно тянет 2–4 кадра вперёд:
-
-- Параллельно запускаются GET'ы для `seq+1, seq+2, ..., seq+ahead` (количество = 2-4 в зависимости от активности).
-- Результаты складываются в `prefetchCache: map[uint64][]byte`.
-- При получении ожидаемого `seq` — берётся из кеша. Out-of-order GET'ы дождутся своего номера.
-- Дырки (404 на `seq+1` при наличии `seq+2`) останавливают consume — данные за gap'ом флашатся когда gap закроется.
-
-Это даёт сущ. снижение latency при сохранении ordering — стандартный шаблон storage-backed протоколов.
 
 ## Webhook fast-path
 
@@ -167,33 +198,35 @@ Yamux-data — стандартный yamux-стрим: handshake → frames →
      }]
    }
    ```
-2. Из key вытаскивает `userPrefix` и `sessionId`. Если сессия зарегистрирована (`Register(sessionId)` сделан в listener'е) — сигналит каналу.
-3. Conn.pollLoop пробуждается, делает GET вне расписания.
+2. Из key вытаскивает `userPrefix` и `sessionId`. Если сессия зарегистрирована (`Register(sessionId)` сделан в listener'е при handshake'е) — сигналит её каналу.
+3. `Conn.pollLoop` пробуждается, делает GET вне расписания.
 
-Без webhook'а латентность доставки = `(pollInterval / 2)` в среднем (50–250ms). С webhook'ом — `<100ms` end-to-end. Webhook **не отменяет poll'а** — 30-секундный fallback страхует от потерянных нотификаций.
+Без webhook'а латентность доставки ≈ `pollInterval / 2` (50–250 мс). С webhook'ом — `<100 мс` end-to-end. Webhook **не отменяет poll'а** — 30-секундный fallback страхует от потерянных нотификаций.
 
 VK Cloud S3 валидирует подписку HMAC-цепочкой `sig = hmac(url, hmac(arn, hmac(timestamp, token)))` — `WebhookHub` отвечает этим значением автоматически (см. [`storage/s3/webhook.go`](https://github.com/Fedarisha/Xray-core-fedarisha/blob/main/proxy/fedarisha/storage/s3/webhook.go)).
 
-## Shared webhook listener
+### Shared listener для нескольких инбаундов
 
-Несколько fedarisha-инбаундов на одной ноде могут шарить один HTTP-листенер. `webhook_registry.go`:
+Несколько fedarisha-инбаундов на одной ноде могут шарить один HTTP-листенер (`webhook_registry.go`):
 
-- Один `http.Server` на `host:port`, разные `publicUrl`-paths мультиплексируются на один listener.
-- Конфликт TLS-настроек на одном `listen` — fatal на старте (`mismatched TLS for listen`).
-- Конфликт `publicUrl` на одном `listen` — тоже fatal.
+- Один `http.Server` на `host:port`, разные `publicUrl`-paths мультиплексируются.
+- Конфликт TLS-настроек на одном `listen` → fatal на старте (`mismatched TLS for listen`).
+- Конфликт `publicUrl` на одном `listen` → тоже fatal.
 
-Это позволяет на одной ноде поднять `fedarisha-eu`, `fedarisha-us`, `fedarisha-ru` инбаунды и обойтись одним `:80` listener'ом.
+То есть на одной ноде можно поднять `fedarisha-eu`, `fedarisha-us`, `fedarisha-ru` инбаунды и обойтись одним `:80` listener'ом.
 
 ## Lifecycle и cleanup
 
-| Что | Когда удаляется | Кем |
+| Объект | Когда удаляется | Кем |
 | --- | --- | --- |
-| Прочитанный кадр | Через `CleanupAge` (30s) после consume | conn.go async delete (10s timeout per call) |
-| Все кадры сессии | На `conn.Close()` | conn.go bulk via `BatchDelete` (≤1000 ключей за вызов) |
-| Брошенная сессия | Не позже 24h | S3 lifecycle rule `Expiration.Days: 1` (поставлена `SetupLifecycle` на старте инбаунда) |
+| Прочитанный кадр | Сразу после consume, async (10s context per file) | `pollLoop` в conn.go |
+| Все кадры сессии + сама папка | На `conn.Close()` | `cleanupSession` через `BatchDelete` (или per-file fallback) |
+| Брошенная сессия (клиент исчез без Close) | Не позже 24h | S3 lifecycle rule `Expiration.Days: 1`, поставленный `SetupLifecycle` |
 | Brokered crash recovery | На рестарте инбаунда — нет (полагаемся на lifecycle) | — |
 
-**Quirk:** `BatchDelete` через `DeleteObjects` поддерживают не все S3-совместимые сторы (Garage до v1.0 не поддерживал). В этом случае conn падает на per-file Delete — `Close` может не успеть в 60s deadline на сессии с тысячами кадров. Если используете не AWS/VK/Selectel/MinIO — проверьте поддержку.
+**Quirk:** `BatchDelete` через `DeleteObjects` поддерживают не все S3-совместимые сторы (Garage до v1.0 не поддерживал). Без него `Close` падает на per-file delete и может не успеть в дедлайн на сессии с тысячами кадров. Если используете не AWS/VK/Selectel/MinIO — проверьте поддержку.
+
+Константа `CleanupAge = 30 * time.Second` в `protocol.go` объявлена, но **в hot-path не используется** — рудимент старой реализации. Реальное удаление — немедленное.
 
 ## Storage type — что понимает xray
 
@@ -205,4 +238,4 @@ VK Cloud S3 валидирует подписку HMAC-цепочкой `sig = h
 
 Если ни одно условие не выполнено — fatal на парсинге.
 
-**На клиенте backend подставляет `type: "s3"` (см. [subscription-flow.md](subscription-flow.md))** — клиентский xray-core-fedarisha PAK-провайдеров не знает и не должен знать.
+**На клиенте бэкенд всегда подставляет `type: "s3"`** ([почему](subscription-flow.md#почему-type-s3)) — клиентский xray-core-fedarisha PAK-провайдеров не знает и не должен знать.
