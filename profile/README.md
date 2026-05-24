@@ -15,9 +15,18 @@
 
 ## Документация
 
+**Для оператора (deploy & config):**
 - **[quickstart.md](quickstart.md)** — деплой панели, sub-page, ноды, reverse-proxy и включение fedarisha-инбаунда.
 - **[inbound-config.md](inbound-config.md)** — полная схема fedarisha-инбаунда: storage / tuning / webhook / clients.
 - **[storage-providers.md](storage-providers.md)** — конфигурация S3-провайдеров (VK Cloud PAK, Selectel IAM, Static).
+
+**Для понимания того, как работает форк:**
+- **[architecture.md](architecture.md)** — карта компонентов, жизненный цикл пользователя, уровни изоляции, где хранится state.
+- **[protocol.md](protocol.md)** — wire-протокол fedarisha-транспорта: раскладка в бакете, handshake, encryption, tuning, webhook.
+- **[node-api.md](node-api.md)** — REST-контракт `/node/fedarisha/{provision,revoke,probe}-user`, что валидируется, как авторизуется.
+- **[subscription-flow.md](subscription-flow.md)** — event-driven provisioning, ensureCredentials, рендер outbound для подписки, failure modes.
+
+**Для разработчика форка:**
 - **[build-from-source.md](build-from-source.md)** — что клонировать, цепочка сборки, релизный workflow.
 
 ## Что внутри форка
