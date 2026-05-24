@@ -2,10 +2,11 @@
 
 Блок `settings.storage` в fedarisha-инбаунде выбирает, как node выдаёт пользователю prefix-scoped S3-доступ. Переключение по полю `type`. Реализация — [`node/src/modules/fedarisha-pak/`](https://github.com/Fedarisha/node/tree/main/src/modules/fedarisha-pak).
 
-| Провайдер | `type` | Стоимость операции | Потолок пользователей на бакет |
-| --- | --- | --- | --- |
-| VK Cloud PAK | `vkcloud-pak` (default) | 1 S3-вызов на provision/revoke | ограничен квотой PAK на мастер-аккаунт |
-| Selectel IAM | `selectel-iam` | 3–4 IAM/S3-вызова на provision | ~100–150 (20 KB policy ceiling) |
+| Провайдер | `type` | Изоляция между юзерами | Стоимость операции | Потолок пользователей на бакет |
+| --- | --- | --- | --- | --- |
+| VK Cloud PAK | `vkcloud-pak` (default) | per-prefix | 1 S3-вызов на provision/revoke | ограничен квотой PAK на мастер-аккаунт |
+| Selectel IAM | `selectel-iam` | per-prefix | 3–4 IAM/S3-вызова на provision | ~100–150 (20 KB policy ceiling) |
+| Static | `static` | **нет** (всем одна пара ключей) | 0 (provision/revoke — no-op) | неограничен |
 
 ## `type: "vkcloud-pak"` (по умолчанию)
 
@@ -57,3 +58,27 @@ Selectel S3 + IAM service users. Node создаёт по одному IAM servi
 - IAM-токен получается **домен-scoped** (`scope: { domain: { name: <accountId> } }`); project-scoped токены отбиваются 401 от `/iam/v1/*`.
 
 **Бакет должен быть выделен под fedarisha** — адаптер перезаписывает bucket policy целиком при каждой операции `provision`/`revoke`.
+
+## `type: "static"`
+
+Pass-through. Каждому пользователю отдаётся **один и тот же** keypair из конфига; никаких операций на стороне S3 (`createKey`/`deleteKey` — no-op). Panel всё ещё назначает каждому юзеру уникальный `prefix`, но соблюдает его только клиент — сам бакет ничего не enforce'ит.
+
+```jsonc
+"storage": {
+  "type": "static",
+  "bucket": "fedarisha",
+  "endpoint": "s3.example.com",
+  "region": "us-east-1",
+  "accessKey": "<shared-access-key>",
+  "secretKey": "<shared-secret-key>",
+  "pathStyle": true                  // опц., нужно для MinIO/Garage без DNS-маршрутизации
+}
+```
+
+Когда подходит:
+
+- self-hosted MinIO/Garage / другой S3, у которого нет credentials-API;
+- single-tenant деплой или полностью доверенная аудитория;
+- быстрая проверка транспорта до того, как поднимать настоящую изоляцию.
+
+**Когда не подходит:** мультитенантные деплои. Любой пользователь видит ровно те же ключи и может читать/перезаписывать чужие prefix-ы.
