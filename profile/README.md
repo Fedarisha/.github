@@ -19,8 +19,8 @@
 
 ## Что внутри
 
-- **[Xray-core-fedarisha](https://github.com/Fedarisha/Xray-core-fedarisha)** — сам транспорт `fedarisha` в xray-core: выдаёт пользователю PAK-токен и ссылку на S3-папку вместо встроенного секрета.
-- **[node](https://github.com/Fedarisha/node)** — `src/modules/fedarisha-pak/*`, провижн/ревок S3-доступа через VK Cloud PAK, Selectel IAM или static. REST `/node/fedarisha/{provision,revoke,probe}-user`.
+- **[Xray-core-fedarisha](https://github.com/Fedarisha/Xray-core-fedarisha)** — сам транспорт `fedarisha` в xray-core: знает, как клиент и инбаунд общаются через файлы в S3-папке (handshake, шифрование, фреймы). PAK-ключи не выдаёт — берёт готовые из `settings.storage`.
+- **[node](https://github.com/Fedarisha/node)** — `src/modules/fedarisha-pak/*`, провижн/ревок S3-доступа через VK Cloud PAK, Selectel IAM или static. REST `/node/fedarisha/{provision,revoke,probe}-user` — **именно здесь выпускаются PAK-ключи**.
 - **[backend](https://github.com/Fedarisha/backend)** — `src/modules/fedarisha-provisioning/*`, оркестратор: на createUser/updateUser/deleteUser зовёт ноды, кеширует выданные ключи, рулит миграциями между inbound-ами.
 - **[subscription-page](https://github.com/Fedarisha/subscription-page)** — отдаёт client-type `fedarisha-json` на `/{shortUuid}/fedarisha-json`, который зашивается в форки клиентов ([v2rayN](https://github.com/Fedarisha/v2rayN), [v2rayNG](https://github.com/Fedarisha/v2rayNG)).
 
