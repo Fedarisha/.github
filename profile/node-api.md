@@ -51,8 +51,8 @@
 
 ### Что происходит на ноде
 
-1. `FedarishaPakService.resolveStorage` находит `inbound.settings.storage` в xray-config. Если нет такого тега или type невалиден — `isOk: false`.
-2. По `storage.type` выбирается провайдер: `vkcloud-pak` → `PakService`, `selectel-iam` → `SelectelPakService`, `static` → `StaticPakService`.
+1. `FedarishaPakService.resolveStorage` находит `inbound.settings.storage` в xray-config. Если нет такого тега или `authType` невалиден — `isOk: false`.
+2. По `storage.authType` выбирается провайдер: `vkcloud-pak` → `PakService`, `selectel-iam` → `SelectelPakService`, `static` → `StaticPakService`. Сам `storage.type` всегда `"s3"` (или ноды разговаривают с локальной директорией, что для PAK-флоу неприменимо).
 3. `buildPakUserName(userUuid, inboundTag)` собирает имя `${userUuid}-${sha1(inboundTag)[:8]}` — это чтобы один и тот же `userUuid` на разных инбаундах не конфликтовал в shared namespace VK Cloud.
 4. Если PAK уже есть на провайдере, но панель его потеряла — отрабатывает **createWithReclaim**: warning, delete старого, retry create.
 5. Параллельно нода добавляет пользователя в живой xray-runtime через xtls gRPC API (см. [Интеграция с xray-runtime](#интеграция-с-xray-runtime-ноды)).

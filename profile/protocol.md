@@ -230,12 +230,11 @@ VK Cloud S3 валидирует подписку HMAC-цепочкой `sig = h
 
 ## Storage type — что понимает xray
 
-`infra/conf/fedarisha.go` принимает в `settings.storage.type`:
+`infra/conf/fedarisha.go` принимает в `settings.storage.type` ровно два значения:
 
 - `"s3"` или пусто (если задан `bucket`) — S3 backend.
 - `"local"` или пусто (если задан `localDir`) — локальная файловая система (для отладки).
-- `"vkcloud-pak"`, `"selectel-iam"`, `"static"` — алиасы на `"s3"` (нода-провайдеры коллапсируются здесь, чтобы конфиг можно было копировать между inbound и outbound без правок).
 
 Если ни одно условие не выполнено — fatal на парсинге.
 
-**На клиенте бэкенд всегда подставляет `type: "s3"`** ([почему](subscription-flow.md#почему-type-s3)) — клиентский xray-core-fedarisha PAK-провайдеров не знает и не должен знать.
+PAK-провайдеры (`vkcloud-pak`/`selectel-iam`/`static`) — отдельная ось, живёт в поле `storage.authType`, и xray-core её **не видит** (Go-парсер молча игнорирует неизвестные поля). Разбор — на ноде (`node/src/modules/fedarisha-pak/`); подробности в [storage-providers.md](storage-providers.md). На клиенте бэкенд всегда подставляет `type: "s3"` и не передаёт `authType` ([почему](subscription-flow.md#почему-type-s3)).

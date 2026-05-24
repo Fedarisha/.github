@@ -23,7 +23,7 @@
 
 Минимальный сетап (без какой-либо панели):
 
-1. **S3-бакет**, к которому есть доступ у обеих сторон. Любой S3-compatible: VK Cloud, Selectel, MinIO, Garage, AWS — что угодно. У нашего сервера будут master-ключи; у клиента — либо те же мастер-ключи (`type: "static"` сценарий), либо отдельный prefix-scoped ключ, который вы выдадите ему сами.
+1. **S3-бакет**, к которому есть доступ у обеих сторон. Любой S3-compatible: VK Cloud, Selectel, MinIO, Garage, AWS — что угодно. У нашего сервера будут master-ключи; у клиента — либо те же мастер-ключи (shared-keys сценарий), либо отдельный prefix-scoped ключ, который вы выдадите ему сами.
 2. **xray-core-fedarisha** на сервере с одним fedarisha-инбаундом:
    ```jsonc
    {
@@ -46,7 +46,7 @@
 
 Всё. После запуска обе стороны начнут писать/читать `<bucket>/sessions/<sessionId>/c_*` и `s_*`.
 
-Полная схема инбаунда (включая `tuning` и `webhook`) — в [inbound-config.md](inbound-config.md). Описание блока `storage` — в [storage-providers.md](storage-providers.md), раздел про `type: "s3"` и `type: "static"`.
+Полная схема инбаунда (включая `tuning` и `webhook`) — в [inbound-config.md](inbound-config.md). Раскладку `type` vs `authType` и список PAK-провайдеров — в [storage-providers.md](storage-providers.md).
 
 ## Что он НЕ даёт
 
@@ -90,7 +90,7 @@
 
 ### Шаг 1. Админ создаёт пользователя в панели
 
-В UI панели Алиса привязана к Internal Squad, в котором есть fedarisha-инбаунд `fedarisha-eu`. Inbound сконфигурирован с PAK-провайдером (не `s3`!) — например, `vkcloud-pak`:
+В UI панели Алиса привязана к Internal Squad, в котором есть fedarisha-инбаунд `fedarisha-eu`. Inbound описывает транспорт (`type: "s3"`) и PAK-провайдера (`authType: "vkcloud-pak"`) — это две независимые оси, см. [storage-providers.md](storage-providers.md):
 
 ```jsonc
 {
@@ -98,11 +98,12 @@
   "protocol": "fedarisha",
   "settings": {
     "storage": {
-      "type":   "vkcloud-pak",                    // ← node-side тип, говорит «нода, ходи за PAK в VK Cloud»
-      "bucket": "vlt-fedarisha-eu",
+      "type":     "s3",                           // ← транспорт для xray-core
+      "authType": "vkcloud-pak",                  // ← говорит ноде «ходи за PAK в VK Cloud»
+      "bucket":   "vlt-fedarisha-eu",
       "endpoint": "https://hb.ru-msk.vkcloud-storage.ru",
-      "region": "ru-msk",
-      "prefix": "users/main",                     // basePrefix для per-user префиксов
+      "region":   "ru-msk",
+      "prefix":   "users/main",                   // basePrefix для per-user префиксов
       "accessKey": "<master S3 access>",          // только для ноды
       "secretKey": "<master S3 secret>"
     },
@@ -133,7 +134,7 @@ Content-Type: application/json
 
 ### Шаг 3. Нода выдаёт PAK у S3-провайдера
 
-`FedarishaPakService` на ноде смотрит на `storage.type` инбаунда:
+`FedarishaPakService` на ноде смотрит на `storage.authType` инбаунда:
 
 - `vkcloud-pak` → один S3-вызов с параметром `?prefixAccess`. VK Cloud возвращает `accessKey/secretKey`, действующие только в пределах указанного префикса.
 - `selectel-iam` → создаёт IAM service user, бьёт его в bucket policy, выдаёт S3-credential.
@@ -180,7 +181,7 @@ https://sub.example.com/<alice shortUuid>/fedarisha-json
 - **Базовая часть** — берётся из xray-config инбаунда: bucket, endpoint, region, tuning.
 - **Per-user часть** — `prefix` подставляется Алисин, `accessKey/secretKey` берутся из кеша. Если кеша нет или PAK не прошёл probe — `ensureCredentials` сходит на ноду за свежим прямо во время рендера подписки.
 
-Важный момент: в outbound клиента `storage.type` всегда `"s3"`, независимо от того, что стоит у инбаунда. PAK-провайдеры (vkcloud-pak, selectel-iam, static) — это **серверное** понятие; клиентский xray их не знает и не должен знать. Это даёт свободу: смена провайдера на ноде не требует перевыпуска подписок.
+Важный момент: в outbound клиента остаётся только `storage.type: "s3"`; `storage.authType` отбрасывается. PAK-провайдеры (`vkcloud-pak`, `selectel-iam`, `static`) — **серверное** понятие; клиентский xray их не знает и не должен знать. Это даёт свободу: смена провайдера на ноде не требует перевыпуска подписок.
 
 ### Шаг 6. Клиент пишет в S3
 
