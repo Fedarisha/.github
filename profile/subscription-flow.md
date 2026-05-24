@@ -27,16 +27,18 @@
 ### ensureForUser: для всех инбаундов сразу
 
 ```
-listPaks(userId)                              ← что уже кешировано
-findUserFedarishaInbounds(userId)             ← на что юзер entitled через squad'ы
-для каждого inbound без свежего кеша:
+existingTags = listPaks(userId).map(p => p.inboundTag)        ← что уже кешировано
+findUserFedarishaInbounds(userId)                             ← на что юзер entitled через squad'ы
+для каждого inbound, чей tag НЕ в existingTags:
     node    = findFirstNodeByInbound(inbound)
-    prefix  = resolveUserPrefix(inbound.basePrefix, userId)   // = "<basePrefix>/<userId>/"
-    creds   = ensureCredentials({ userId, userUuid, inbound, prefix })
-    upsertPak(userId, inbound.inboundTag, creds)
+    creds   = ensureCredentials({ userId, userUuid, inbound })
+    // ensureCredentials сам считает expectedPrefix = "<basePrefix>/<userId>/"
+    // и пишет результат в кеш через repository.upsertPak
 ```
 
-Тут есть тонкость: `ensureForUser` **не лезет в инбаунды, у которых уже есть кеш с правильным префиксом**. Реальный probe и решение «жив ли PAK» делается позже в `ensureCredentials`. Это значит, что событие `USER.ENABLED` не вызывает шквала S3-вызовов, если кеш живой.
+Тут есть тонкость: `ensureForUser` **пропускает инбаунд, если в кеше уже есть запись с таким `inboundTag` — независимо от того, какой там префикс**. Проверка «префикс актуален и PAK живой» делается позже в `ensureCredentials` (`buildOutboundForHost` зовёт его на каждый fetch подписки). Так event-driven путь не превращается в шквал S3-вызовов на каждом `USER.MODIFIED`, а валидация переезжает на медленный path подписки, где она дешевле амортизируется.
+
+Цена компромисса: если админ поменял `basePrefix` инбаунду и сразу же стрельнул `USER.ENABLED`, prefix-mismatch обнаружится только на следующем fetch'е подписки клиентом, а не здесь.
 
 Если для `configProfileUuid` нет ни одной enabled-ноды — warning, инбаунд молча пропускается. Когда нода появится, ближайший fetch подписки вызовет `ensureCredentials` через `buildOutboundForHost`, и провижн произойдёт там.
 

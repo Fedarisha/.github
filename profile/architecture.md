@@ -242,7 +242,7 @@ https://sub.example.com/<alice shortUuid>/fedarisha-json
 
 Это про Remnawave-сценарий (в standalone большая часть оговорок неактуальна).
 
-**Бакет под fedarisha — отдельный, дедицированный.** Не складывайте туда ничего полезного. Selectel перезаписывает bucket policy целиком на каждое изменение members, а xray ставит lifecycle-rule, который удаляет всё в `/sessions/`-префиксах старше 24 часов.
+**Бакет под fedarisha — отдельный, дедицированный.** Не складывайте туда ничего полезного. Selectel перезаписывает bucket policy целиком на каждое изменение members, а xray ставит lifecycle-rule, который удаляет **всё под `settings.storage.prefix`** старше 24 часов (минимум, который позволяет AWS S3). Несколько инбаундов на одном бакете получают отдельные правила, разнесённые по `prefix` — see `SetupLifecycle` в `proxy/fedarisha/storage/s3/lifecycle.go`.
 
 **Master S3 credentials живут только на ноде.** В UI панели они лежат в xray-config как plain text — клиенту не уходят никогда. Клиентский xray получает только prefix-scoped PAK; компрометация клиента не повышает привилегий до мастера.
 

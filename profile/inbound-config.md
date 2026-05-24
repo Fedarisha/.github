@@ -42,16 +42,21 @@
 
 | Поле | Тип | Обяз. | Описание |
 | --- | --- | --- | --- |
-| `type` | string | да | `vkcloud-pak` \| `selectel-iam` \| `static` — выбирает PAK-провайдера. Дефолта нет. |
-| `bucket` | string | да | Имя S3-бакета (выделить отдельно под fedarisha). |
+| `type` | string | да | `s3` \| `local` \| `vkcloud-pak` \| `selectel-iam` \| `static` — см. [storage-providers.md](storage-providers.md). Регистр не важен (значение приводится к нижнему при выборе backend'а в `buildStorage`). Если пусто — fallback на `s3` (когда задан `bucket`) или `local` (когда задан `localDir`); иначе fatal. |
+| `bucket` | string | да* | Имя S3-бакета. Обязателен для всех `type`, кроме `local`/`localDir`-fallback. |
 | `endpoint` | string | да | S3-endpoint без схемы (`hb.ru-msk.vkcloud-storage.ru`). |
 | `region` | string | нет | Регион для подписи; пустая строка работает на большинстве S3. |
 | `prefix` | string | нет | Base-prefix внутри бакета (корень для per-user префиксов). |
 | `accessKey` / `secretKey` | string | да | Master-ключи (vkcloud-pak / static — рабочие; selectel — только для `PutBucketPolicy`). |
-| `iam.*` | object | для selectel-iam | Учётка IAM-админа Selectel — см. [storage-providers.md](storage-providers.md). |
-| `pathStyle` | bool | нет | Только для `static`; принудительно path-style URL (MinIO/Garage без DNS). |
 | `sessionsDir` | string | нет | Поддиректорий для активных сессий внутри `prefix`. Дефолт — корень `prefix`. |
 | `localDir` | string | нет | Альтернатива S3 — локальная директория (`type` пустой + `localDir` задан). Только для отладки на одной машине. |
+
+**Дополнительные поля для node-side PAK-провайдеров.** Их видит и интерпретирует только NestJS-слой ноды (`src/modules/fedarisha-pak/`), а парсер xray-core (`infra/conf/fedarisha.go`) их молча игнорирует:
+
+| Поле | Тип | Обяз. | Описание |
+| --- | --- | --- | --- |
+| `iam.*` | object | для `selectel-iam` | Учётка IAM-админа Selectel и опц. URL'ы (`identityUrl`/`apiUrl`) — см. [storage-providers.md](storage-providers.md). |
+| `pathStyle` | bool | нет | Используется только node-side probe для `static` (MinIO/Garage без DNS). На S3-клиент xray-core не влияет — там path-style включён всегда, как только задан `endpoint`. |
 
 ## `settings.tuning` (опц.)
 
@@ -59,7 +64,7 @@
 
 | Поле | Дефолт | Что делает |
 | --- | --- | --- |
-| `pollIntervalMs` | listener: `500` без webhook'а, `10 000` с webhook'ом | Как часто **listener** проверяет S3 на новые сессии. На скорость чтения уже установленной сессии не влияет — там работают адаптивные тайеры (см. [protocol.md](protocol.md#адаптивный-polling)). |
+| `pollIntervalMs` | `500` без webhook'а; `10 000` (жёстко) с webhook'ом | Как часто **listener** делает LIST по `sessionsDir`, чтобы заметить новую папку сессии. На скорость чтения уже установленной сессии не влияет — там conn использует hardcoded адаптивные тайеры 20/100/500 мс (см. [protocol.md](protocol.md#адаптивный-polling)). С webhook'ом listener'у этот LIST почти не нужен — поэтому при `WebhookHub != nil` значение принудительно переопределяется в 10 секунд, даже если задано другое. |
 | `writeIntervalMs` | `20` | Как часто writer флашит accumulator в S3. Меньше → ниже latency, больше → крупнее объекты и меньше PUT'ов. |
 | `idleTimeoutSec` | `300` | Сессия закрывается, если не было полученных данных столько секунд. Yamux keepalive (60с) ресетит таймер. |
 | `maxFileSizeBytes` | `2 097 152` (2 MiB) | Лимит одного файла-чанка в S3. Превышение → разбивка на N PUT'ов размером ≤ лимита. |

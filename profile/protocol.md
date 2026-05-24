@@ -178,7 +178,7 @@ go func(p string) {
 
 | Параметр | Где применяется | Влияние |
 | --- | --- | --- |
-| `pollIntervalMs` | `pollLoop` в conn.go (по сути — backstop) | Перекрывает адаптивный тайер 500 мс, если задан явно. В режиме с webhook'ом смысла мало — основной канал и так fast-path. |
+| `pollIntervalMs` | `watchLoop` в listener.go | Как часто listener делает LIST по `sessionsDir`, чтобы заметить новую папку сессии (без webhook'а — дефолт 500 мс; с webhook'ом принудительно 10 с, значение из tuning игнорируется). На pollLoop уже установленной conn'ы **не влияет** — там адаптивные тайеры 20/100/500 мс зашиты в код (поле `c.pollInterval` хранится, но в hot-path не читается). |
 | `writeIntervalMs` | `writeLoop` в conn.go | Как часто writer флашит accumulator в S3. Меньше → ниже latency, но больше PUT'ов и мельче объекты. |
 | `idleTimeoutSec` | `idleWatcher` в conn.go | Сколько секунд без полученных данных до закрытия. Yamux keepalive (60s) ресетит таймер. |
 | `maxFileSizeBytes` | flush в conn.go | Лимит одного кадра. Превышение → разбивка на N PUT'ов размером ≤ лимита. |
@@ -201,7 +201,7 @@ go func(p string) {
 2. Из key вытаскивает `userPrefix` и `sessionId`. Если сессия зарегистрирована (`Register(sessionId)` сделан в listener'е при handshake'е) — сигналит её каналу.
 3. `Conn.pollLoop` пробуждается, делает GET вне расписания.
 
-Без webhook'а латентность доставки ≈ `pollInterval / 2` (50–250 мс). С webhook'ом — `<100 мс` end-to-end. Webhook **не отменяет poll'а** — 30-секундный fallback страхует от потерянных нотификаций.
+Без webhook'а латентность доставки нового кадра ≈ половина адаптивного тайера conn'ы (~10–250 мс на активной сессии). С webhook'ом — `<100 мс` end-to-end. Webhook **не отменяет poll'а** — 30-секундный fallback страхует от потерянных нотификаций. Tuning-параметр `pollIntervalMs` влияет на задержку *обнаружения новой сессии* listener'ом, но не на latency внутри уже установленной сессии.
 
 VK Cloud S3 валидирует подписку HMAC-цепочкой `sig = hmac(url, hmac(arn, hmac(timestamp, token)))` — `WebhookHub` отвечает этим значением автоматически (см. [`storage/s3/webhook.go`](https://github.com/Fedarisha/Xray-core-fedarisha/blob/main/proxy/fedarisha/storage/s3/webhook.go)).
 
