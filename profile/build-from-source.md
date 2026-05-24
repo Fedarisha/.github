@@ -40,7 +40,7 @@ docker build -f .github/docker/Dockerfile \
 
 ### Node
 
-Подхватывает xray multi-stage из `XRAY_IMAGE` (по умолчанию `ghcr.io/fedarisha/xray-core:latest`).
+Подхватывает xray multi-stage из `XRAY_IMAGE` (по умолчанию `voltara13/xray-core:latest`).
 
 ```bash
 cd ~/fedarisha/node
@@ -89,7 +89,7 @@ docker build -t voltara13/subscription-page:latest .
 
 ## Релизы
 
-В каждом репо `.github/workflows/build-and-push.yml` собирает мульти-arch образ на push тега и публикует в Docker Hub (`voltara13/*`) и GHCR (`ghcr.io/fedarisha/*`). Нужны секреты `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`, `TOKEN_GH_DEPLOY`.
+В каждом репо `.github/workflows/build-and-push.yml` собирает мульти-arch образ на push тега и публикует в Docker Hub (`voltara13/*`). Нужны секреты `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`.
 
 Порядок ручного релиза (та же схема тегирования):
 

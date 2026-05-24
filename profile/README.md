@@ -2,14 +2,14 @@
 
 Форк [Remnawave](https://github.com/remnawave) с собственным транспортом `fedarisha`: prefix-scoped S3-доставка PAK-токенов вместо классических Trojan/VLESS-секретов.
 
-Все образы публикуются в Docker Hub и GHCR — собирать ничего не нужно.
+Все образы публикуются в Docker Hub — собирать ничего не нужно.
 
 | Сервис | Образ |
 | --- | --- |
-| xray-core | `voltara13/xray-core:latest` · `ghcr.io/fedarisha/xray-core:latest` |
-| node | `voltara13/node:latest` · `ghcr.io/fedarisha/node:latest` |
-| backend (+ frontend) | `voltara13/backend:latest` · `ghcr.io/fedarisha/backend:latest` |
-| subscription-page | `voltara13/subscription-page:latest` · `ghcr.io/fedarisha/subscription-page:latest` |
+| xray-core | `voltara13/xray-core:latest` |
+| node | `voltara13/node:latest` |
+| backend (+ frontend) | `voltara13/backend:latest` |
+| subscription-page | `voltara13/subscription-page:latest` |
 
 Теги — `vX.Y.Z-fed.N` (`X.Y.Z` — апстрим, `-fed.N` — счётчик форка).
 
