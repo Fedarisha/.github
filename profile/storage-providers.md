@@ -1,20 +1,20 @@
 # S3-провайдеры для PAK-токенов
 
-Блок `settings.storage` в fedarisha-инбаунде выбирает, как node выдаёт пользователю prefix-scoped S3-доступ. Переключение по полю `type`. Реализация — [`node/src/modules/fedarisha-pak/`](https://github.com/Fedarisha/node/tree/main/src/modules/fedarisha-pak).
+Блок `settings.storage` в fedarisha-инбаунде выбирает, как node выдаёт пользователю prefix-scoped S3-доступ. Переключение по обязательному полю `type` — провайдер по умолчанию не назначается, неуказанный или неизвестный `type` приводит к ошибке provision/revoke. Реализация — [`node/src/modules/fedarisha-pak/`](https://github.com/Fedarisha/node/tree/main/src/modules/fedarisha-pak).
 
 | Провайдер | `type` | Изоляция между юзерами | Стоимость операции | Потолок пользователей на бакет |
 | --- | --- | --- | --- | --- |
-| VK Cloud PAK | `vkcloud-pak` (default) | per-prefix | 1 S3-вызов на provision/revoke | ограничен квотой PAK на мастер-аккаунт |
+| VK Cloud PAK | `vkcloud-pak` | per-prefix | 1 S3-вызов на provision/revoke | ограничен квотой PAK на мастер-аккаунт |
 | Selectel IAM | `selectel-iam` | per-prefix | 3–4 IAM/S3-вызова на provision | ~100–150 (20 KB policy ceiling) |
 | Static | `static` | **нет** (всем одна пара ключей) | 0 (provision/revoke — no-op) | неограничен |
 
-## `type: "vkcloud-pak"` (по умолчанию)
+## `type: "vkcloud-pak"`
 
 VK Cloud Prefix Access Keys. Node создаёт PAK через S3-расширение `?prefixAccess` мастер-ключами.
 
 ```jsonc
 "storage": {
-  "type": "vkcloud-pak",        // можно опустить — это значение по умолчанию
+  "type": "vkcloud-pak",
   "bucket": "vlt-prod",
   "endpoint": "hb.ru-msk.vkcloud-storage.ru",
   "region": "ru-msk",
