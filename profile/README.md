@@ -16,7 +16,8 @@
 ## Документация
 
 - **[quickstart.md](quickstart.md)** — деплой панели, sub-page, ноды, reverse-proxy и включение fedarisha-инбаунда.
-- **[storage-providers.md](storage-providers.md)** — конфигурация S3-провайдеров (VK Cloud PAK, Selectel IAM).
+- **[inbound-config.md](inbound-config.md)** — полная схема fedarisha-инбаунда: storage / tuning / webhook / clients.
+- **[storage-providers.md](storage-providers.md)** — конфигурация S3-провайдеров (VK Cloud PAK, Selectel IAM, Static).
 - **[build-from-source.md](build-from-source.md)** — что клонировать, цепочка сборки, релизный workflow.
 
 ## Что внутри форка

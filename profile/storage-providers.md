@@ -2,6 +2,8 @@
 
 Блок `settings.storage` в fedarisha-инбаунде выбирает, как node выдаёт пользователю prefix-scoped S3-доступ. Переключение по обязательному полю `type` — провайдер по умолчанию не назначается, неуказанный или неизвестный `type` приводит к ошибке provision/revoke. Реализация — [`node/src/modules/fedarisha-pak/`](https://github.com/Fedarisha/node/tree/main/src/modules/fedarisha-pak).
 
+> Полная схема fedarisha-инбаунда (`storage` + `tuning` + `webhook` + `clients`) — в [inbound-config.md](inbound-config.md). Этот документ покрывает только `storage`.
+
 | Провайдер | `type` | Изоляция между юзерами | Стоимость операции | Потолок пользователей на бакет |
 | --- | --- | --- | --- | --- |
 | VK Cloud PAK | `vkcloud-pak` | per-prefix | 1 S3-вызов на provision/revoke | ограничен квотой PAK на мастер-аккаунт |
