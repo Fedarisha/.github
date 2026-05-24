@@ -1,6 +1,12 @@
 # fedarisha-инбаунд: полная схема
 
-Один JSON-элемент массива `inbounds[]` в xray-config панели. Парсер на ноде — [`Xray-core-fedarisha/infra/conf/fedarisha.go`](https://github.com/Fedarisha/Xray-core-fedarisha/blob/main/infra/conf/fedarisha.go), исполнение — [`proxy/fedarisha/{inbound,outbound,webhook_registry}.go`](https://github.com/Fedarisha/Xray-core-fedarisha/tree/main/proxy/fedarisha).
+Один JSON-элемент массива `inbounds[]` в xray-config. Это **схема транспорта**, не панели — её понимает любой xray-core-fedarisha, без какого-либо Remnawave-стека.
+
+Парсер — [`Xray-core-fedarisha/infra/conf/fedarisha.go`](https://github.com/Fedarisha/Xray-core-fedarisha/blob/main/infra/conf/fedarisha.go), исполнение — [`proxy/fedarisha/{inbound,outbound,webhook_registry}.go`](https://github.com/Fedarisha/Xray-core-fedarisha/tree/main/proxy/fedarisha).
+
+Если используете xray-core-fedarisha **без панели** — вы заполняете все поля сами и держите `clients[]` синхронизированным руками (или оставляете пустым для single-user).
+
+Если работаете **через панель** — `clients[]` заполняется бэкендом автоматически на provision/revoke, а `webhook` получает дефолты от `applyFedarishaWebhookDefaults`. Остальное вы всё равно конфигурите сами.
 
 ## Из чего состоит
 
