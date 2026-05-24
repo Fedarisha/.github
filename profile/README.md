@@ -1,6 +1,10 @@
 # Fedarisha
 
-Форк [Remnawave](https://github.com/remnawave) с собственным транспортом `fedarisha`: prefix-scoped S3-доставка PAK-токенов вместо классических Trojan/VLESS-секретов.
+Форк [Remnawave](https://github.com/remnawave), в котором клиент общается с нодой **через файлы в S3-бакете**, а не через TCP. DPI видит обычные PUT/GET к публичному облаку — не VPN; чтобы заблокировать форк, провайдеру нужно отрезать целое облако (VK Cloud, Selectel, что вы поставите).
+
+Цена — латентность 50–250 мс и стоимость S3-запросов. Зато блокировка по IP ноды больше не работает.
+
+## Что брать
 
 Все образы публикуются в Docker Hub — собирать ничего не нужно.
 
@@ -13,25 +17,28 @@
 
 Теги — `vX.Y.Z-fed.N` (`X.Y.Z` — апстрим, `-fed.N` — счётчик форка).
 
+## Что внутри
+
+- **[Xray-core-fedarisha](https://github.com/Fedarisha/Xray-core-fedarisha)** — сам транспорт `fedarisha` в xray-core: выдаёт пользователю PAK-токен и ссылку на S3-папку вместо встроенного секрета.
+- **[node](https://github.com/Fedarisha/node)** — `src/modules/fedarisha-pak/*`, провижн/ревок S3-доступа через VK Cloud PAK, Selectel IAM или static. REST `/node/fedarisha/{provision,revoke,probe}-user`.
+- **[backend](https://github.com/Fedarisha/backend)** — `src/modules/fedarisha-provisioning/*`, оркестратор: на createUser/updateUser/deleteUser зовёт ноды, кеширует выданные ключи, рулит миграциями между inbound-ами.
+- **[subscription-page](https://github.com/Fedarisha/subscription-page)** — отдаёт client-type `fedarisha-json` на `/{shortUuid}/fedarisha-json`, который зашивается в форки клиентов ([v2rayN](https://github.com/Fedarisha/v2rayN), [v2rayNG](https://github.com/Fedarisha/v2rayNG)).
+
 ## Документация
 
-**Для оператора (deploy & config):**
-- **[quickstart.md](quickstart.md)** — деплой панели, sub-page, ноды, reverse-proxy и включение fedarisha-инбаунда.
-- **[inbound-config.md](inbound-config.md)** — полная схема fedarisha-инбаунда: storage / tuning / webhook / clients.
-- **[storage-providers.md](storage-providers.md)** — конфигурация S3-провайдеров (VK Cloud PAK, Selectel IAM, Static).
+**Если разворачиваете:**
 
-**Для понимания того, как работает форк:**
-- **[architecture.md](architecture.md)** — карта компонентов, жизненный цикл пользователя, уровни изоляции, где хранится state.
-- **[protocol.md](protocol.md)** — wire-протокол fedarisha-транспорта: раскладка в бакете, handshake, encryption, tuning, webhook.
-- **[node-api.md](node-api.md)** — REST-контракт `/node/fedarisha/{provision,revoke,probe}-user`, что валидируется, как авторизуется.
-- **[subscription-flow.md](subscription-flow.md)** — event-driven provisioning, ensureCredentials, рендер outbound для подписки, failure modes.
+- **[quickstart.md](quickstart.md)** — собрать compose-стек панели, sub-page, ноды и включить fedarisha-инбаунд.
+- **[inbound-config.md](inbound-config.md)** — полная схема fedarisha-инбаунда: `storage`/`tuning`/`webhook`/`clients`.
+- **[storage-providers.md](storage-providers.md)** — какой S3-провайдер выбрать и как его конфигурить (VK Cloud PAK, Selectel IAM, Static).
 
-**Для разработчика форка:**
+**Если разбираетесь, как форк устроен:**
+
+- **[architecture.md](architecture.md)** — карта компонентов и жизнь одного пользователя от `USER.ENABLED` до первого кадра в бакете.
+- **[protocol.md](protocol.md)** — wire-протокол: раскладка объектов, handshake, шифрование, tuning, webhook.
+- **[node-api.md](node-api.md)** — REST-контракт `/node/fedarisha/{provision,revoke,probe}-user`.
+- **[subscription-flow.md](subscription-flow.md)** — event-driven provisioning, `ensureCredentials`, рендер outbound, failure modes.
+
+**Если правите форк:**
+
 - **[build-from-source.md](build-from-source.md)** — что клонировать, цепочка сборки, релизный workflow.
-
-## Что внутри форка
-
-- Свой transport `fedarisha` в [Xray-core-fedarisha](https://github.com/Fedarisha/Xray-core-fedarisha) — выдаёт пользователю PAK-токен и ссылку на S3-объект вместо встроенного секрета.
-- [node](https://github.com/Fedarisha/node) `src/modules/fedarisha-pak/*` — провижн/ревок S3-доступа через VK Cloud PAK или Selectel IAM, REST `/node/fedarisha/{provision,revoke,probe}-user`.
-- [backend](https://github.com/Fedarisha/backend) `src/modules/fedarisha-provisioning/*` — оркестратор: на createUser/updateUser/deleteUser зовёт ноды, кеширует выданные ключи, разруливает миграции между inbound-ами.
-- [subscription-page](https://github.com/Fedarisha/subscription-page) — отдаёт client-type `fedarisha-json` на `/{shortUuid}/fedarisha-json`, который зашивается в форки клиентов ([v2rayN](https://github.com/Fedarisha/v2rayN), [v2rayNG](https://github.com/Fedarisha/v2rayNG)).

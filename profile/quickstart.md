@@ -1,8 +1,15 @@
 # Quickstart
 
-Развёртывание панели + sub-page + одной ноды на готовых образах. Версии — `voltara13/*:latest`, шаги совпадают с upstream Remnawave; отличия выделены отдельно.
+Развёртывание полного стека на готовых образах. По итогу получите:
 
-> S3-провайдер и формат блока `settings.storage` в fedarisha-инбаунде — в [storage-providers.md](storage-providers.md).
+- **Панель** на `panel.example.com` (backend + Postgres + Valkey).
+- **Subscription-page** на `sub.example.com`, отдающую `fedarisha-json` для форк-клиентов.
+- **Одну ноду** на отдельной машине, которая будет выдавать PAK-ключи на S3-бакет и проксировать через него трафик.
+- **Один fedarisha-инбаунд** в xray-config панели, привязанный к Internal Squad.
+
+Если стек уже знаком по upstream Remnawave — отличия только в образах (`voltara13/*`) и в одном новом блоке настроек инбаунда. Всё остальное — стандартный compose-флоу.
+
+Параметры самого fedarisha-инбаунда (storage / tuning / webhook) — в [inbound-config.md](inbound-config.md); выбор S3-провайдера и формат блока `storage` — в [storage-providers.md](storage-providers.md).
 
 ## 1. Панель (backend + Postgres + Valkey)
 
@@ -110,7 +117,7 @@ volumes:
     external: false
 ```
 
-`.env` — стандартный remnawave (`POSTGRES_*`, `JWT_AUTH_SECRET`, `JWT_API_TOKENS_SECRET`, `WEBHOOK_*`, `SUB_PUBLIC_DOMAIN`, …; полный список в `backend/.env.sample`).
+`.env` — стандартный remnawave (`POSTGRES_*`, `JWT_AUTH_SECRET`, `JWT_API_TOKENS_SECRET`, `WEBHOOK_*`, `SUB_PUBLIC_DOMAIN`, …; полный список — в `backend/.env.sample`).
 
 ```bash
 cd /opt/remnawave && docker compose pull && docker compose up -d
@@ -122,31 +129,33 @@ cd /opt/remnawave && docker compose pull && docker compose up -d
 
 ```yaml
 services:
-    remnawave-subscription-page:
-        image: voltara13/subscription-page:latest
-        container_name: remnawave-subscription-page
-        hostname: remnawave-subscription-page
-        restart: always
-        env_file:
-            - .env
-        ports:
-            - '127.0.0.1:3010:3010'
-        networks:
-            - remnawave-network
+  remnawave-subscription-page:
+    image: voltara13/subscription-page:latest
+    container_name: remnawave-subscription-page
+    hostname: remnawave-subscription-page
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - '127.0.0.1:3010:3010'
+    networks:
+      - remnawave-network
 
 networks:
-    remnawave-network:
-        driver: bridge
-        external: true
+  remnawave-network:
+    driver: bridge
+    external: true
 ```
 
 `.env`:
 
 ```
 APP_PORT=3010
-REMNAWAVE_PANEL_URL=http://remnawave:3000        # или https://panel.example.com если на другом хосте
+REMNAWAVE_PANEL_URL=http://remnawave:3000        # или https://panel.example.com, если на другом хосте
 REMNAWAVE_API_TOKEN=<токен из админки панели>
 ```
+
+Sub-page сам обрабатывает client-type `fedarisha-json` (зарегистрирован в `root.controller.ts`) — отдельный rewrite или middleware не нужен.
 
 ## 3. Node (на каждой выходной машине)
 
@@ -166,14 +175,14 @@ services:
         hard: 1048576
     environment:
       - NODE_PORT=2222
-      - SECRET_KEY="..."
+      - SECRET_KEY="..."             # выдаётся панелью при регистрации ноды
 ```
 
-Node уже содержит `xray` + `geoip.dat`/`geosite.dat` из `voltara13/xray-core`.
+Образ ноды уже содержит `xray` + `geoip.dat`/`geosite.dat` из `voltara13/xray-core` — отдельно качать ничего не нужно.
+
+`network_mode: host` нужен, чтобы webhook-listener инбаунда (по умолчанию `:80`) был доступен из сети S3-провайдера. Если оборачиваете ноду в reverse-proxy — можно перейти на bridge и пробросить порт явно.
 
 ## 4. Reverse-proxy (Caddy)
-
-Subscription-page сам обрабатывает fedarisha-роуты (`fedarisha-json` зарегистрирован как client-type в `root.controller.ts`), отдельный rewrite не нужен:
 
 ```caddy
 sub.example.com {
@@ -185,10 +194,16 @@ panel.example.com {
 }
 ```
 
+Никаких отдельных rewrite'ов для `fedarisha-json` — sub-page сам отвечает на `/{shortUuid}/fedarisha-json` (см. [subscription-flow.md](subscription-flow.md#что-отдаёт-subscription-page)).
+
 ## 5. Включение fedarisha в панели
 
-1. `Settings → API Tokens` → создать токен, прописать в `subscription-page/.env` как `REMNAWAVE_API_TOKEN`.
-2. В Xray-конфиге панели добавить inbound с `"protocol": "fedarisha"`. Валидатор требует webhook-блок (см. `backend/src/common/utils/apply-fedarisha-webhook-defaults.ts`) — туда подставляются S3-настройки доставки PAK-конфигов. Формат блока `settings.storage` описан в [storage-providers.md](storage-providers.md).
-3. На каждой ноде указать `SECRET_KEY` (выдаётся панелью при регистрации) и `NODE_PORT`. Node поднимет xray + REST-сервис, принимающий `/node/fedarisha/{provision,revoke,probe}-user`.
-4. Создать Internal Squad с fedarisha-inbound и привязать пользователей. Backend начнёт ходить в node `provision-user`, node — писать PAK в S3-бакет.
-5. Subscription-URL для fedarisha-клиентов: `https://sub.example.com/{shortUuid}/fedarisha-json` — этот URL зашивается в клиент (v2rayN-core-bin / v2rayNG-форк).
+К этому моменту панель, sub-page и нода живые, но ни одного fedarisha-инбаунда ещё нет. Финальные шаги:
+
+1. **API-токен для sub-page.** `Settings → API Tokens` → создать токен, прописать в `subscription-page/.env` как `REMNAWAVE_API_TOKEN`, перезапустить sub-page.
+2. **Зарегистрировать ноду.** В UI панели завести node-record, скопировать `SECRET_KEY` в `.env` ноды.
+3. **Добавить fedarisha-инбаунд.** В xray-конфиге config-profile панели добавить элемент с `"protocol": "fedarisha"`. Полная схема — [inbound-config.md](inbound-config.md), формат `settings.storage` — [storage-providers.md](storage-providers.md). Если задать `"webhook": {}` — backend подставит дефолты (`:80`, `/webhook`, `autoSetup: true`).
+4. **Создать Internal Squad** с этим инбаундом и привязать пользователей. На каждый `USER.ENABLED` backend дёрнет `/node/fedarisha/provision-user` → нода выпишет PAK у S3-провайдера и добавит юзера в живой xray-runtime.
+5. **Раздать ссылку.** Subscription-URL для fedarisha-клиентов: `https://sub.example.com/{shortUuid}/fedarisha-json` — этот URL зашивается в форк-клиенты ([v2rayN](https://github.com/Fedarisha/v2rayN), [v2rayNG](https://github.com/Fedarisha/v2rayNG)).
+
+Дальше — обычный Remnawave-флоу: пользователи, squad'ы, квоты, метрики. Fedarisha не меняет ничего, кроме того, что один из инбаундов теперь S3-backed.
