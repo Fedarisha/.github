@@ -23,7 +23,7 @@
 Теги — `vX.Y.Z-fed.N` (`X.Y.Z` — апстрим, `-fed.N` — счётчик форка).
 
 Клиенты:
-- **[v2rayN](https://github.com/Fedarisha/v2rayN)** / **[v2rayNG](https://github.com/Fedarisha/v2rayNG)** — форки UI-клиентов со встроенным xray-core-fedarisha и пониманием подписочного `fedarisha-json`.
+- **[v2rayN](https://github.com/voltara13/v2rayN)** / **[v2rayNG](https://github.com/voltara13/v2rayNG)** — форки UI-клиентов со встроенным xray-core-fedarisha и пониманием подписочного `fedarisha-json`.
 - Чистый xray-core-fedarisha можно использовать и без UI — обычный `xray run -c config.json`.
 
 ## Документация

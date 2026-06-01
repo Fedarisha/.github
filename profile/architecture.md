@@ -237,7 +237,7 @@ https://sub.example.com/<alice shortUuid>/fedarisha-json
 | Remnawave | [`node`](https://github.com/Fedarisha/node) | NestJS-модуль `FedarishaPakModule` — REST + три PAK-провайдера | `src/modules/fedarisha-pak/` |
 | Remnawave | [`backend`](https://github.com/Fedarisha/backend) | `FedarishaProvisioningModule` (events + кеш), `FedarishaSubscriptionService` (рендер), webhook-defaults, Zod-схема | `src/modules/fedarisha-provisioning/`, `src/common/utils/apply-fedarisha-webhook-defaults.ts` |
 | Remnawave | [`subscription-page`](https://github.com/Fedarisha/subscription-page) | Регистрация client-type `fedarisha-json` | `backend/src/modules/root/root.controller.ts` |
-| Клиенты | [`v2rayN`](https://github.com/Fedarisha/v2rayN), [`v2rayNG`](https://github.com/Fedarisha/v2rayNG) | Форки клиентов с встроенным xray-core-fedarisha и пониманием `fedarisha-json` | импортируют ядро как submodule |
+| Клиенты | [`v2rayN`](https://github.com/voltara13/v2rayN), [`v2rayNG`](https://github.com/voltara13/v2rayNG) | Форки клиентов с встроенным xray-core-fedarisha и пониманием `fedarisha-json` | импортируют ядро как submodule |
 
 ## Что важно знать про деплой
 

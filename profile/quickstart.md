@@ -204,6 +204,6 @@ panel.example.com {
 2. **Зарегистрировать ноду.** В UI панели завести node-record, скопировать `SECRET_KEY` в `.env` ноды.
 3. **Добавить fedarisha-инбаунд.** В xray-конфиге config-profile панели добавить элемент с `"protocol": "fedarisha"`. Полная схема — [inbound-config.md](inbound-config.md), формат `settings.storage` — [storage-providers.md](storage-providers.md). Если задать `"webhook": {}` — backend подставит дефолты (`:80`, `/webhook`, `autoSetup: true`).
 4. **Создать Internal Squad** с этим инбаундом и привязать пользователей. На каждый `USER.ENABLED` backend дёрнет `/node/fedarisha/provision-user` → нода выпишет PAK у S3-провайдера и добавит юзера в живой xray-runtime.
-5. **Раздать ссылку.** Subscription-URL для fedarisha-клиентов: `https://sub.example.com/{shortUuid}/fedarisha-json` — этот URL зашивается в форк-клиенты ([v2rayN](https://github.com/Fedarisha/v2rayN), [v2rayNG](https://github.com/Fedarisha/v2rayNG)).
+5. **Раздать ссылку.** Subscription-URL для fedarisha-клиентов: `https://sub.example.com/{shortUuid}/fedarisha-json` — этот URL зашивается в форк-клиенты ([v2rayN](https://github.com/voltara13/v2rayN), [v2rayNG](https://github.com/voltara13/v2rayNG)).
 
 Дальше — обычный Remnawave-флоу: пользователи, squad'ы, квоты, метрики. Fedarisha не меняет ничего, кроме того, что один из инбаундов теперь S3-backed.
