@@ -199,6 +199,8 @@ const isKnownClientType =
 
 Этот URL зашит в форки клиентов (`v2rayN`-fork, `v2rayNG`-fork). Пользователь кладёт его в «Subscription URL», клиент периодически refetch'ит. **Дефолтный интервал у клиентов — 12 часов.** Без event-driven `ensureForUser` юзер до 12 часов тянул бы пустую подписку после активации.
 
+По умолчанию подписка отдаёт инбаунды без Fedarisha-инбаунда (чтобы не сломались другие клиенты которые не поддерживают инбаунд Fedarisha). Чтобы получить подписку с Fedarisha-инбаундом - необходимо в конец подписки добавить `fedarisha-json`, то есть должно получиться что-то вроде `sub.your-domain.com/fedarisha-json`
+
 ## Webhook defaults
 
 Когда бэкенд собирает xray-config для ноды (через `start-all-nodes-by-profile.processor`), вызывается `applyFedarishaWebhookDefaults`:
